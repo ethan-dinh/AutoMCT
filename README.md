@@ -1,10 +1,10 @@
-# MicroCT Analysis Package
+# AutoMCT
+Automated layer-by-layer or volumetric analysis of microCT data from BMP files using Python and open-source tools.
 
-Automated layer-by-layer analysis of microCT data from BMP files using Python and open-source tools.
-
-## 🚀 Features
+## Features
 
 - **Volume Reconstruction**: Convert BMP file stacks into 3D volumes
+- **Curved Multi-Planar Reconstruction**: Reorients the volume based on the curvature of the surface
 - **Multiple Segmentation Methods**: Otsu, local thresholding, watershed, and manual thresholding
 - **Region Analysis**: Comprehensive measurement of region properties (area, intensity, shape, etc.)
 - **Region Comparison**: Compare two regions per slice with various metrics
@@ -12,30 +12,13 @@ Automated layer-by-layer analysis of microCT data from BMP files using Python an
 - **Command Line Interface**: Easy-to-use CLI for batch processing
 - **Export Results**: Save results in JSON, CSV, or Excel formats
 
-## 📦 Installation
+## Installation
+Follow the instructions in the [INSTALL.md](./library/INSTALL.md) file. This will walk you through the process of installing the package and its dependencies via conda or pip.
 
-### Option 1: Using Conda (Recommended)
-
-```bash
-# Create and activate conda environment
-conda env create -f environment.yml
-conda activate microct-analysis
-```
-
-### Option 2: Using pip
-
-```bash
-# Create virtual environment
-python -m venv microct-env
-source microct-env/bin/activate  # On Windows: microct-env\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-## 🏃‍♂️ Quick Start
+## Quick Start
 
 ### Basic Usage
+Once the package is installed, you can use the `MicroCTAnalyzer` class to run the analysis.
 
 ```python
 from microct_analysis import MicroCTAnalyzer
@@ -61,30 +44,14 @@ print(analyzer.get_summary_report())
 ```
 
 ### Command Line Interface
+The package can be run via the command line. Below is an example of how to run the package.
 
 ```bash
 # Basic analysis
-python cli.py /path/to/bmp/files --output results.json
-
-# Analysis with custom parameters
-python cli.py /path/to/bmp/files \
-    --segmentation-method watershed \
-    --min-area 200 \
-    --output results.json
-
-# Analysis with visualization
-python cli.py /path/to/bmp/files \
-    --output results.json \
-    --visualize \
-    --save-plots plots/
-
-# Analysis of specific slice range
-python cli.py /path/to/bmp/files \
-    --slice-range 10 50 \
-    --output results.json
+python -m microct_analysis.cli <test_dir> --output ./cli_test_results.json --slice-range 0 3 --summary-report
 ```
 
-## 📚 Detailed Usage
+## Detailed Usage
 
 ### Step-by-Step Workflow
 
@@ -151,10 +118,14 @@ visualize_results(results, save_dir="plots/")
 
 # 3D visualization (requires napari)
 from microct_analysis import create_3d_visualization
-create_3d_visualization(volume, labeled_volume)
+additional_volumes = {
+    "slices": (slices_volume, "yellow"),
+    "smoothed_centerline": (centerline_mask, "green")
+}
+create_3d_visualization(volume, labeled_volume, additional_volumes=additional_volumes, show_bounding_box=True)
 ```
 
-## 📊 Output Formats
+## Output Formats
 
 ### JSON Output
 ```json
@@ -194,7 +165,7 @@ analyzer = MicroCTAnalyzer(
 ### CLI Options
 
 ```bash
-python cli.py --help
+python -m microct_analysis.cli --help
 ```
 
 Available options:
@@ -206,40 +177,7 @@ Available options:
 - `--save-plots`: Directory to save plots
 - `--verbose`: Verbose output
 
-## 📁 Project Structure
-
-```
-MicroCT-Analysis/
-├── microct_analysis/          # Main package
-│   ├── __init__.py
-│   ├── volume_loader.py       # BMP loading utilities
-│   ├── segmentation.py        # Segmentation methods
-│   ├── measurement.py         # Region measurement
-│   ├── analysis.py           # Main analysis class
-│   └── visualization.py      # Plotting utilities
-├── cli.py                    # Command-line interface
-├── example_usage.py          # Usage examples
-├── environment.yml           # Conda environment
-├── requirements.txt          # pip requirements
-└── README.md               # This file
-```
-
-## 🧪 Examples
-
-Run the example script to see the package in action:
-
-```bash
-python example_usage.py
-```
-
-This will:
-1. Create sample BMP files
-2. Demonstrate basic workflow
-3. Show step-by-step analysis
-4. Compare segmentation methods
-5. Run custom analysis
-
-## 🔬 Scientific Applications
+## Scientific Applications
 
 This package is designed for:
 
@@ -248,19 +186,11 @@ This package is designed for:
 - **Biological Research**: Study cellular structures and distributions
 - **Quality Control**: Automated inspection of manufactured parts
 
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
-
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - **scikit-image**: Image processing and segmentation
 - **numpy**: Numerical computations
@@ -268,14 +198,14 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - **napari**: 3D visualization
 - **Pillow**: Image I/O
 
-## 📞 Support
+## Support
 
 For questions or issues:
-1. Check the examples in `example_usage.py`
+1. Check the examples in `example_usage.py` or review the mandible analysis pipeline
 2. Review the CLI help: `python cli.py --help`
 3. Open an issue on GitHub
 
-## 🔄 Version History
+## Version History
 
 - **v1.0.0**: Initial release with basic functionality
   - BMP stack loading
@@ -283,3 +213,5 @@ For questions or issues:
   - Region measurement and comparison
   - Visualization tools
   - Command-line interface 
+
+- **2.0.0**: Added curved multi-planar reconstruction
