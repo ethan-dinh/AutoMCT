@@ -1,0 +1,31 @@
+# Ignore macos files
+.DS_Store
+
+# Ignore python files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+
+# Ignore library files
+*.egg-info/
+*.egg
+
+# Ignore vscode files
+.vscode/
+
+# Ignore data files
+*/data/
+data/
+
+# Ignore results files
+*/results/
+results/
+mandible_analysis/scripts/segment_mandible/segmentation_results/
+*.html
+
+# Ignore test files
+test_results.json
+cli_test_results.json
