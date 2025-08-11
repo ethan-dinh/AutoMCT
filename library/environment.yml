@@ -1,0 +1,25 @@
+name: microct-analysis
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - numpy
+  - scipy
+  - scikit-image
+  - pillow
+  - matplotlib
+  - pandas
+  - seaborn
+  - jupyter
+  - napari
+  - tqdm
+  - tifffile
+  - pyqt
+  - scikit-learn
+  - pip
+  - pip:
+    - opencv-python
+    - plotly
+    - ipywidgets 
+    - PyOpenGL-accelerate
