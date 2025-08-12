@@ -149,7 +149,7 @@ create_3d_visualization(volume, labeled_volume, additional_volumes=additional_vo
 - **Segmentation Sheet**: Per-slice segmentation statistics
 - **Regions Sheet**: Detailed region measurements
 
-## 🔧 Configuration
+## Configuration
 
 ### Analysis Parameters
 
