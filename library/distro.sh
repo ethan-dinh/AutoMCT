@@ -148,11 +148,11 @@ test_distribution() {
     pip install dist/*.whl || pip install dist/*.tar.gz
     
     # Test import
-    python -c "import microct_analysis; print('Import successful')"
+    python -c "import automct; print('Import successful')"
     
     # Test CLI
-    if command_exists microct-analyze; then
-        microct-analyze --help > /dev/null
+    if command_exists automct-analyze; then
+    automct-analyze --help > /dev/null
         print_success "CLI test passed"
     else
         print_warning "CLI not found in PATH"
@@ -191,18 +191,18 @@ Release Date: $date
 
 ### From Source
 \`\`\`bash
-pip install dist/microct_analysis-*.whl
+pip install dist/automct-*.whl
 \`\`\`
 
 ### From PyPI (when available)
 \`\`\`bash
-pip install microct-analysis
+pip install automct
 \`\`\`
 
 ## Usage
 
 \`\`\`python
-from microct_analysis import MicroCTAnalyzer
+from automct import MicroCTAnalyzer
 
 analyzer = MicroCTAnalyzer()
 results = analyzer.run_complete_analysis("/path/to/bmp/files")
@@ -211,7 +211,7 @@ results = analyzer.run_complete_analysis("/path/to/bmp/files")
 ## Command Line
 
 \`\`\`bash
-microct-analyze /path/to/bmp/files --output results.json --visualize
+automct-analyze /path/to/bmp/files --output results.json --visualize
 \`\`\`
 
 ## Requirements

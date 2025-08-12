@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Setup script for MicroCT Analysis Package.
-This script is used to distribute the microct-analysis package. 
+Setup script for AutoMCT Package.
+This script is used to distribute the automct package. 
 
-This scripts is used to install the microct-analysis package via pip.
+This scripts is used to install the automct package via pip.
 It requires the user to be in the installation directory (installation/).
 """
 
@@ -21,14 +21,14 @@ def read_requirements():
         return [line.strip() for line in fh if line.strip() and not line.startswith("#")]
 
 setup(
-    name="microct-analysis",
+    name="automct",
     version="1.0.0",
     author="Ethan Dinh DDS/PhD Student, UCSF",
     author_email="ethan.dinh@ucsf.edu",
     description="Automated layer-by-layer analysis of microCT data from BMP files",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
-    url="https://github.com/ethan-dinh/microct-analysis",
+    url="https://github.com/ethan-dinh/automct",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -61,15 +61,15 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "microct-analyze=microct_analysis.cli:main",
+            "automct-analyze=automct.cli:main",
         ],
     },
     include_package_data=True,
     zip_safe=False,
     keywords="microct, image-analysis, segmentation, dental-research, dental-imaging",
     project_urls={
-        "Bug Reports": "https://github.com/ethan-dinh/microct-analysis/issues",
-        "Source": "https://github.com/ethan-dinh/microct-analysis",
-        "Documentation": "https://microct-analysis.readthedocs.io/",
+        "Bug Reports": "https://github.com/ethan-dinh/automct/issues",
+        "Source": "https://github.com/ethan-dinh/automct",
+        "Documentation": "https://automct.readthedocs.io/",
     },
 ) 

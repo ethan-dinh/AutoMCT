@@ -21,7 +21,7 @@ Follow the instructions in the [INSTALL.md](./library/INSTALL.md) file. This wil
 Once the package is installed, you can use the `MicroCTAnalyzer` class to run the analysis.
 
 ```python
-from microct_analysis import MicroCTAnalyzer
+from automct import MicroCTAnalyzer
 
 # Create analyzer
 analyzer = MicroCTAnalyzer(
@@ -48,7 +48,7 @@ The package can be run via the command line. Below is an example of how to run t
 
 ```bash
 # Basic analysis
-python -m microct_analysis.cli <test_dir> --output ./cli_test_results.json --slice-range 0 3 --summary-report
+python -m automct.cli <test_dir> --output ./cli_test_results.json --slice-range 0 3 --summary-report
 ```
 
 ## Detailed Usage
@@ -56,7 +56,7 @@ python -m microct_analysis.cli <test_dir> --output ./cli_test_results.json --sli
 ### Step-by-Step Workflow
 
 ```python
-from microct_analysis import (
+from automct import (
     load_bmp_stack, 
     segment_slice, 
     measure_regions,
@@ -111,13 +111,13 @@ Each region is measured for various properties:
 ### Visualization
 
 ```python
-from microct_analysis import visualize_results
+from automct import visualize_results
 
 # Create comprehensive visualizations
 visualize_results(results, save_dir="plots/")
 
 # 3D visualization (requires napari)
-from microct_analysis import create_3d_visualization
+from automct import create_3d_visualization
 additional_volumes = {
     "slices": (slices_volume, "yellow"),
     "smoothed_centerline": (centerline_mask, "green")
@@ -165,7 +165,7 @@ analyzer = MicroCTAnalyzer(
 ### CLI Options
 
 ```bash
-python -m microct_analysis.cli --help
+python -m automct.cli --help
 ```
 
 Available options:

@@ -11,7 +11,7 @@ import numpy as np
 import logging
 
 # Import the analysis package
-from microct_analysis import (
+from automct import (
     MicroCTAnalyzer, 
     load_bmp_stack, 
     segment_slice, 

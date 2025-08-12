@@ -13,7 +13,7 @@ import tifffile as tiff
 import argparse
 from tqdm import tqdm
 import os
-import microct_analysis as mca
+import automct as mca
 from skimage.measure import regionprops
 from skimage.morphology import binary_opening, disk
 from skimage import exposure

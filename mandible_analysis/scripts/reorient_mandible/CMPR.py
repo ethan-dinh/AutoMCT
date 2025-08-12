@@ -18,7 +18,7 @@ from scipy.ndimage import map_coordinates
 from skimage.morphology import skeletonize
 from scipy.interpolate import splprep, splev
 
-import microct_analysis as mca
+import automct as mca
 import networkx as nx
 import plotly.graph_objects as go
 

@@ -21,7 +21,7 @@ This guide provides detailed instructions for setting up the MicroCT Analysis pa
 2. **Create and activate the conda environment**:
    ```bash
    conda env create -f environment.yml
-   conda activate microct-analysis
+   conda activate automct
    ```
 
 3. **Verify installation**:

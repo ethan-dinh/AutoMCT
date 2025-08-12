@@ -48,7 +48,7 @@ def test_basic_functionality():
     
     try:
         # Import the package
-        from microct_analysis import (
+        from automct import (
             load_bmp_stack,
             segment_slice,
             measure_regions,
@@ -123,7 +123,7 @@ def test_cli():
         
         # Test CLI with test data
         cmd = [
-            sys.executable, "-m", "microct_analysis.cli",
+            sys.executable, "-m", "automct.cli",
             test_dir,
             "--output", "./cli_test_results.json",
             "--slice-range", "0", "3",

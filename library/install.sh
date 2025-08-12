@@ -92,8 +92,8 @@ install_conda() {
 create_conda_env() {
     print_status "Creating conda environment..."
     
-    if conda env list | grep -q "microct-analysis"; then
-        print_warning "Environment 'microct-analysis' already exists."
+    if conda env list | grep -q "automct"; then
+    print_warning "Environment 'automct' already exists."
         echo -n "Do you want to update the existing environment? (y/n): "
         read -r response
         if [[ "$response" =~ ^[Yy]$ ]]; then
@@ -263,7 +263,7 @@ main() {
         # Activate environment
         print_status "Activating conda environment..."
         source $(conda info --base)/etc/profile.d/conda.sh
-        conda activate microct-analysis
+        conda activate automct
         
         # Install package in development mode
         pip install -e .
@@ -281,7 +281,7 @@ main() {
     echo "Next steps:"
     echo "1. Activate the environment:"
     if [ "$install_method" = "conda" ]; then
-        echo "   conda activate microct-analysis"
+        echo "   conda activate automct"
     else
         echo "   source microct-env/bin/activate"
     fi

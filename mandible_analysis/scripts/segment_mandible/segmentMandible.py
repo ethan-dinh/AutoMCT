@@ -5,12 +5,11 @@ Visualize the mandible in an orthographic view.
 import os
 import numpy as np
 import logging
-import microct_analysis as mca
+import automct as mca
 from skimage.measure import regionprops
 import argparse
 from tqdm import tqdm
 import tifffile as tiff
-from skimage.morphology import skeletonize
 
 # Setup logging
 def setup_logging():

@@ -1,25 +1,22 @@
-name: microct-analysis
+name: automct
 channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.9
+  - python>=3.8
   - numpy
   - scipy
   - scikit-image
-  - pillow
   - matplotlib
+  - tqdm
+  - tifffile
+  - pillow
   - pandas
   - seaborn
   - jupyter
-  - napari
-  - tqdm
-  - tifffile
-  - pyqt
-  - scikit-learn
+  - ipykernel
   - pip
   - pip:
     - opencv-python
     - plotly
-    - ipywidgets 
-    - PyOpenGL-accelerate
+    - kaleido
