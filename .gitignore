@@ -29,3 +29,4 @@ mandible_analysis/scripts/segment_mandible/segmentation_results/
 # Ignore test files
 test_results.json
 cli_test_results.json
+/segment_mandible/tests/segmentation_results/
