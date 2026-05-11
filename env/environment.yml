@@ -1,0 +1,27 @@
+name: microct-analysis
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  # Core scientific stack
+  - numpy
+  - scipy
+  - scikit-image
+  - tifffile
+  - networkx
+  - plotly
+  - tqdm
+  - pillow
+  - matplotlib
+  # Visualization
+  - napari
+  # Build tools
+  - pip
+  - pip:
+      # NRRD file I/O
+      - pynrrd
+      # Deep learning (ML-Segmentation module)
+      # For GPU support, install PyTorch separately — see env/README.md
+      - torch>=2.0
+      - monai>=1.3
