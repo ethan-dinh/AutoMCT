@@ -1,5 +1,6 @@
 # Ignore macos files
 .DS_Store
+._*
 
 # Ignore python files
 __pycache__/
@@ -30,3 +31,13 @@ mandible_analysis/scripts/segment_mandible/segmentation_results/
 test_results.json
 cli_test_results.json
 /segment_mandible/tests/segmentation_results/
+
+# Ignore cache files
+*/.det_cache/
+
+# Ignore training files
+*/training/
+
+# Ignore Claude Files
+.claude/
+CLAUDE.md
