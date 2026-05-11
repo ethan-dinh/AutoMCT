@@ -3,12 +3,14 @@ Mandible segmentation pipeline: loads raw data and returns segmented volumes.
 """
 
 import gc
+import glob
 import logging
+import os
 
 import numpy as np
 
-from data_io import load_bmp_stack
-from preprocessing import find_min_intensity_of_bone, find_threshold, normalize_volume, reorient_mandible
+from data_io import load_bmp_stack, load_nrrd, load_tiff
+from preprocessing import find_min_intensity_of_bone, find_threshold, non_local_means_filter, normalize_volume, reorient_mandible, tv_denoise_volume
 from segmentation import segment_incisor, segment_molar_bone
 from segmentation.utils import dilate_mask, remove_small_islands
 from visualization import create_3d_visualization
@@ -41,16 +43,54 @@ def segment_mandible(
         or None on failure.
     """
     try:
-        bmp_data = load_bmp_stack(
-            input_path, file_pattern="*.bmp", exclude_pattern="*spr.bmp"
-        )
+        if input_path.endswith(".nrrd"):
+            bmp_data = load_nrrd(input_path)
+            if bmp_data is None:
+                logger.error("Failed to load NRRD file: %s", input_path)
+                return None
+        elif input_path.endswith((".tif", ".tiff")):
+            bmp_data = load_tiff(input_path)
+            if bmp_data is None:
+                logger.error("Failed to load TIFF file: %s", input_path)
+                return None
+        elif os.path.isdir(input_path):
+            # Check what files are inside the directory
+            nrrd_files = glob.glob(os.path.join(input_path, "*.nrrd"))
+            tif_files = glob.glob(os.path.join(input_path, "*.tif")) + glob.glob(os.path.join(input_path, "*.tiff"))
+            bmp_files = glob.glob(os.path.join(input_path, "*.bmp"))
+
+            if nrrd_files:
+                bmp_data = load_nrrd(nrrd_files[0])
+                if bmp_data is None:
+                    logger.error("Failed to load NRRD file: %s", nrrd_files[0])
+                    return None
+            elif tif_files:
+                bmp_data = load_tiff(tif_files[0])
+                if bmp_data is None:
+                    logger.error("Failed to load TIFF file: %s", tif_files[0])
+                    return None
+            elif bmp_files:
+                bmp_data = load_bmp_stack(
+                    input_path, file_pattern="*.bmp", exclude_pattern="*spr.bmp"
+                )
+            else:
+                logger.error("No supported files (.nrrd, .tif, .tiff, .bmp) found in %s", input_path)
+                return None
+        else:
+            logger.error("Unsupported input path: %s", input_path)
+            return None
     except Exception as e:
-        logger.error("Error loading BMP file: %s", e)
+        logger.error("Error loading input data: %s", e)
         return None
 
     try:
-        normalized_volume = normalize_volume(bmp_data)
         # bmp_data is kept; we need it at the end for the returned volumes
+        normalized_volume = normalize_volume(bmp_data)
+        
+        # Denoising filters can be very slow, so we apply them after normalization to speed up processing and reduce memory usage. We found that applying denoising before normalization can actually amplify noise in some cases, so this order seems to work best for our data.
+        normalized_volume = non_local_means_filter(normalized_volume)
+        normalized_volume = tv_denoise_volume(normalized_volume)
+    
     except Exception as e:
         logger.error("Error normalizing volume: %s", e)
         return None
@@ -63,11 +103,21 @@ def segment_mandible(
         logger.info("Finding minimum bone intensity from middle slices")
         min_bone_intensity = find_min_intensity_of_bone(normalized_volume)
 
-        logger.info("Finding valley threshold between background and bone peaks")
-        bg_bone_valley = find_threshold(normalized_volume, debug=debug, bias=-0.6)
+        logger.info("Finding threshold between background and bone peaks")
+        bg_bone_valley = find_threshold(
+            normalized_volume,
+            strategy="knee", 
+            debug=debug
+        )
 
         logger.info("Determining conservative threshold for incisor isolation")
-        conservative_threshold = find_threshold(normalized_volume, debug=debug, bias=0.4)
+        conservative_threshold = find_threshold(
+            normalized_volume, 
+            debug=debug,
+            strategy="valley",
+            fallback_fraction=0.38,
+            bias=0.4
+        )
 
         preprocessed_volume = np.where(
             normalized_volume > bg_bone_valley,

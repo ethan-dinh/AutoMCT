@@ -1,11 +1,12 @@
 """
-I/O utilities: loading BMP stacks and TIFF volumes, saving TIFF outputs.
+I/O utilities: loading BMP stacks, TIFF volumes, and NRRD files, saving TIFF/NRRD outputs.
 """
 
 import glob
 import logging
 import os
 
+import nrrd
 import numpy as np
 import tifffile as tiff
 from PIL import Image
@@ -73,6 +74,40 @@ def load_bmp_stack(
 
     logger.info("Volume loaded successfully: %s", volume.shape)
     return volume
+
+
+def load_nrrd(input_path: str) -> np.ndarray | None:
+    """
+    Load an NRRD file into a 3D numpy array.
+
+    Parameters:
+        input_path: Path to the .nrrd file.
+
+    Returns:
+        3D numpy array with shape (depth, height, width), or None if the
+        file does not exist.
+    """
+    if not os.path.exists(input_path):
+        logger.error("File %s does not exist", input_path)
+        return None
+
+    data, header = nrrd.read(input_path)
+    logger.info(
+        "Loaded NRRD: shape=%s, dtype=%s, space=%s",
+        data.shape, data.dtype, header.get("space", "N/A"),
+    )
+
+    # NRRD files often store data as (X, Y, Z). Transpose to (Z, Y, X) to
+    # match the (depth, height, width) convention used by the rest of the
+    # pipeline.
+    if data.ndim == 3 and header.get("space", "").startswith("left-posterior-superior"):
+        data = np.transpose(data, (2, 1, 0))
+        logger.info("Transposed LPS NRRD to (Z, Y, X): %s", data.shape)
+    elif data.ndim == 3:
+        data = np.transpose(data, (2, 1, 0))
+        logger.info("Transposed NRRD to (Z, Y, X): %s", data.shape)
+
+    return data
 
 
 def load_tiff(input_path: str) -> np.ndarray | None:
@@ -155,3 +190,36 @@ def save_mask_as_tiff(
     output_path = os.path.join(out_root, f"{name}.tif")
     tiff.imwrite(output_path, mask_uint8, dtype=np.uint8, compression="zlib", bigtiff=True)
     logger.info("Saved mask to %s", output_path)
+
+
+def save_as_nrrd(
+    volume: np.ndarray,
+    output_dir: str,
+    name: str,
+    base_dir: str | None = None,
+) -> None:
+    """
+    Save a 3D volume as an NRRD file.
+
+    The volume is stored in (Z, Y, X) order consistent with the rest of the
+    pipeline, then transposed to (X, Y, Z) for NRRD convention.
+
+    Parameters:
+        volume: 3D array to save.
+        output_dir: Sub-directory name under the save root.
+        name: Base filename (without extension).
+        base_dir: Root directory for output. Defaults to ./segmentation_results.
+    """
+    root = base_dir if base_dir is not None else "./segmentation_results"
+    out_root = os.path.join(root, output_dir)
+    os.makedirs(out_root, exist_ok=True)
+
+    if volume.dtype == np.float64:
+        volume = volume.astype(np.float32)
+
+    # Transpose from pipeline (Z, Y, X) back to NRRD (X, Y, Z)
+    data = np.transpose(volume, (2, 1, 0))
+
+    output_path = os.path.join(out_root, f"{name}.nrrd")
+    nrrd.write(output_path, data, compression_level=9)
+    logger.info("Saved NRRD to %s", output_path)

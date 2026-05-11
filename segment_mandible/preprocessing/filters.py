@@ -4,6 +4,8 @@ bridge cutting, and bone intensity estimation.
 """
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal, Optional
 
 import numpy as np
@@ -17,6 +19,7 @@ from skimage.morphology import (
 )
 from skimage.segmentation import clear_border
 from skimage.morphology import erosion as bin_erode2d
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,125 @@ def gaussian_filter_volume(volume: np.ndarray, sigma: float = 1.0) -> np.ndarray
     """Apply a Gaussian filter to a 3D volume."""
     logger.info("Applying Gaussian filter with sigma = %f", sigma)
     return gaussian_filter(volume, sigma=sigma)
+
+
+def non_local_means_filter(
+    volume: np.ndarray,
+    *,
+    h: Optional[float] = None,
+    patch_size: int = 5,
+    patch_distance: int = 6,
+    fast_mode: bool = True,
+    per_slice: bool = True,
+    n_jobs: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Apply non-local means denoising to a 3D volume.
+
+    Reduces noise while preserving edges and fine structural details — important
+    for accurate thresholding and segmentation of microCT data.
+
+    Parameters:
+        h: Filter strength (cut-off distance for patch-weight decay).
+           Estimated from the local noise level per slice when None.
+        patch_size: Side length (in pixels) of the square patches compared.
+        patch_distance: Maximum search radius (in pixels) for similar patches.
+        fast_mode: Use the approximated fast NLM variant (slightly lower
+                   quality but orders of magnitude faster).
+        per_slice: When True (default), run 2D NLM on each axial slice
+                   independently.  This is far faster and uses far less memory
+                   than full 3D NLM, which is impractical for large volumes.
+        n_jobs: Number of parallel threads for per-slice mode.
+                None (default) uses all available CPUs; 1 disables parallelism.
+                skimage's NLM is Cython-backed and releases the GIL, so threads
+                provide true parallelism without pickling overhead.
+    """
+    from skimage.restoration import denoise_nl_means, estimate_sigma
+
+    volume = volume.astype(np.float32)
+    workers = n_jobs if n_jobs is not None else os.cpu_count()
+    logger.info(
+        "Applying non-local means filter (per_slice=%s, patch_size=%d, "
+        "patch_distance=%d, fast_mode=%s, n_jobs=%d)",
+        per_slice, patch_size, patch_distance, fast_mode, workers,
+    )
+
+    if per_slice:
+        result = np.empty_like(volume)
+
+        def _denoise_slice(i: int) -> tuple[int, np.ndarray]:
+            sl = volume[i]
+            h_use = h if h is not None else float(0.8 * estimate_sigma(sl))
+            return i, denoise_nl_means(
+                sl,
+                h=h_use,
+                patch_size=patch_size,
+                patch_distance=patch_distance,
+                fast_mode=fast_mode,
+            )
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_denoise_slice, i): i for i in range(volume.shape[0])}
+            with tqdm(total=volume.shape[0], desc="Applying non-local means filter") as pbar:
+                for future in as_completed(futures):
+                    i, denoised = future.result()
+                    result[i] = denoised
+                    pbar.update(1)
+
+        return result
+
+    h_use = h if h is not None else float(0.8 * estimate_sigma(volume))  # type: ignore
+    return denoise_nl_means(
+        volume,
+        h=h_use,
+        patch_size=patch_size,
+        patch_distance=patch_distance,
+        fast_mode=fast_mode,
+    ).astype(np.float32)
+
+
+def tv_denoise_volume(
+    volume: np.ndarray,
+    *,
+    weight: float = 0.05,
+    n_jobs: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Apply Total Variation (TV) denoising to a 3D volume, slice by slice.
+
+    TV denoising enforces piecewise-constant regions, which sharpens the
+    boundary between bone and background and produces cleaner histogram peaks
+    for thresholding. It is best applied after NLM denoising, which removes
+    stochastic noise first.
+
+    Parameters:
+        weight: Denoising strength. Higher values produce smoother, more
+                cartoon-like output; lower values stay closer to the input.
+                Typical range for normalized microCT data: 0.05 – 0.3.
+        n_jobs: Number of parallel threads. None uses all available CPUs.
+    """
+    from skimage.restoration import denoise_tv_chambolle
+
+    volume = volume.astype(np.float32)
+    workers = n_jobs if n_jobs is not None else os.cpu_count()
+    logger.info(
+        "Applying TV denoising (weight=%.3f, n_jobs=%d)", weight, workers,
+    )
+
+    result = np.empty_like(volume)
+
+    def _denoise_slice(i: int) -> tuple[int, np.ndarray]:
+        return i, denoise_tv_chambolle(volume[i], weight=weight).astype(np.float32)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_denoise_slice, i): i for i in range(volume.shape[0])}
+        with tqdm(total=volume.shape[0], desc="Applying TV denoising") as pbar:
+            for future in as_completed(futures):
+                i, denoised = future.result()
+                result[i] = denoised
+                pbar.update(1)
+
+    return result
 
 
 # ------------------------------------------------------------------
@@ -143,277 +265,151 @@ def cut_bridges_slice(
 # ------------------------------------------------------------------
 # Valley threshold (background / bone separation)
 # ------------------------------------------------------------------
-def find_threshold(
-    volume: np.ndarray,
-    middle_fraction: float = 0.20,
-    nbins: int = 128,
-    smooth_sigma: float = 5.0,
-    fallback_fraction: float = 0.45,
-    debug: bool = False,
-    second_peak_min_sep: float = 0.08,
-    second_peak_prom_frac: float = 0.01,
-    bias: float = -0.45, # Shift threshold toward background (negative) or bone (positive). Default -0.3 is a moderate shift toward background to help preserve faint bone voxels.
-    strategy: Literal["valley", "knee"] = "valley",
-    conservative: bool = False,
+def _find_histogram_peaks(curve: np.ndarray, prom_frac: float) -> tuple[np.ndarray, dict]:
+    prom = max(float(curve.max()) * prom_frac, 1e-8)
+    return find_peaks(curve, prominence=prom)
+
+
+def _threshold_knee(
+    bin_centres: np.ndarray,
+    smoothed: np.ndarray,
+    counts: np.ndarray,
+    peak_a: int,
+    peaks_all: np.ndarray,
+    fallback: float,
+    fallback_fraction: float,
+    debug: bool,
 ) -> float:
     """
-    Find a threshold separating background from bone.
+    Return a normalized threshold in [0, 1] at the knee/elbow on the
+    right descending side of peak_a.
 
-    Peak finding is done on the smoothed histogram only.
-    The raw histogram is used only for debug plotting.
+    This uses the maximum perpendicular distance from the descending
+    smooth curve to the chord connecting the peak to the tail.
 
-    Parameters
-    ----------
-    second_peak_min_sep:
-        Minimum intensity separation, in histogram x-units, to begin searching
-        for the second peak after the first one.
-    second_peak_prom_frac:
-        Relative prominence threshold for the second peak search, expressed as
-        a fraction of the global smoothed histogram maximum.
-    bias:
-        Fractional shift of the threshold toward the larger (bone) peak.
-        0.0 (default) places the threshold at the valley minimum. 1.0 moves
-        it all the way to the bone peak. Negative values shift toward the
-        background peak. Must be in [-1, 1].
-    strategy:
-        Overall thresholding strategy.
-        ``"valley"`` (default) finds two histogram peaks and places the
-        threshold at the valley between them.
-        ``"knee"`` finds the dominant (low-intensity) peak and places the
-        threshold where its right descending slope flattens out, without
-        searching for a secondary peak.
-    conservative:
-        Only used when ``strategy="knee"``. If ``True``, selects the
-        ``argmax`` of grad2 in the post-crossing region (earlier, more
-        conservative threshold). If ``False`` (default), selects the
-        ``argmin`` (further right, more permissive threshold).
+    Why this instead of curvature?
+    - Curvature can get pulled into the flat tail or noisy regions.
+    - For histogram-like decay, the "bottom of the hill" is better
+      approximated by the elbow / max distance to chord.
+
+    Returns:
+        threshold in [0, 1]
     """
-    depth = volume.shape[0]
-    half = max(1, int(depth * middle_fraction / 2))
-    mid = depth // 2
-    start = max(0, mid - half)
-    end = min(depth, mid + half)
-    roi = volume[start:end]
-
-    logger.info(
-        "Valley threshold ROI: slices %d-%d (%d slices, %.0f%% of volume)",
-        start, end, roi.shape[0], middle_fraction * 100,
-    )
-
-    voxels = roi[roi > 0]
-    if voxels.size == 0:
-        logger.warning("Valley threshold: no nonzero voxels in ROI - returning 0")
-        return 0.0
-
-    counts, edges = np.histogram(voxels, bins=nbins)
-    bin_centres = (edges[:-1] + edges[1:]) / 2.0
-    smoothed = gaussian_filter1d(counts.astype(np.float64), sigma=smooth_sigma)
-
-    def _plot(
-        title: str,
-        threshold: float,
-        peak_a: int | None = None,
-        peak_b: int | None = None,
-        valley_idx: int | None = None,
-        peaks_arr: np.ndarray | None = None,
-        curve: np.ndarray | None = None,
-    ) -> None:
+    n = len(smoothed)
+    if n < 4:
+        logger.warning(
+            "Knee threshold: insufficient points - falling back to %.4f (%.0f%% of ROI max)",
+            fallback,
+            fallback_fraction * 100,
+        )
         if debug:
             _plot_valley_histogram(
                 bin_centres,
                 counts,
-                curve if curve is not None else smoothed,
-                peaks_arr if peaks_arr is not None else np.array([], dtype=int),
-                valley_idx=valley_idx,
-                threshold=threshold,
-                peak_a=peak_a,
-                peak_b=peak_b,
-                title=title,
-            )
-
-    def _find_peaks(curve: np.ndarray, prom_frac: float) -> tuple[np.ndarray, dict]:
-        prom = max(float(curve.max()) * prom_frac, 1e-8)
-        return find_peaks(curve, prominence=prom)
-
-    fallback = float(voxels.max() * fallback_fraction)
-
-    # 1) Find the dominant low-intensity peak.
-    peaks_all, props_all = _find_peaks(smoothed, prom_frac=0.05)
-
-    if len(peaks_all) == 0:
-        logger.warning(
-            "Valley threshold: no peaks found on first pass - entering retry loop "
-            "(up to 5 attempts, trimming bottom 2%% of intensity range each time)"
-        )
-        _active_voxels = voxels
-        _active_counts, _active_edges = counts, edges
-        _active_centres, _active_smoothed = bin_centres, smoothed
-
-        for _attempt in range(1, 6):
-            _clip_pct = _attempt * 2
-            _low = float(np.percentile(_active_voxels, 2))
-            _active_voxels = _active_voxels[_active_voxels > _low]
-
-            if _active_voxels.size == 0:
-                logger.warning(
-                    "Valley threshold retry %d/%d: no voxels remain after trimming "
-                    "bottom %d%% - stopping early",
-                    _attempt, 5, _clip_pct,
-                )
-                break
-
-            _active_counts, _active_edges = np.histogram(_active_voxels, bins=nbins)
-            _active_centres = (_active_edges[:-1] + _active_edges[1:]) / 2.0
-            _active_smoothed = gaussian_filter1d(
-                _active_counts.astype(np.float64), sigma=smooth_sigma
-            )
-            peaks_all, props_all = _find_peaks(_active_smoothed, prom_frac=0.05)
-
-            if len(peaks_all) > 0:
-                logger.info(
-                    "Valley threshold retry %d/%d: found %d peak(s) after trimming "
-                    "bottom %d%% of intensity range (intensity floor raised to %.4f)",
-                    _attempt, 5, len(peaks_all), _clip_pct, _low,
-                )
-                bin_centres = _active_centres
-                smoothed = _active_smoothed
-                counts = _active_counts
-                break
-
-            logger.warning(
-                "Valley threshold retry %d/%d: still no peaks after trimming "
-                "bottom %d%% of intensity range (intensity floor raised to %.4f)",
-                _attempt, 5, _clip_pct, _low,
-            )
-
-        if len(peaks_all) == 0:
-            logger.warning(
-                "Valley threshold: no peaks found after 5 retries - "
-                "falling back to %.4f (%.0f%% of ROI max)",
-                fallback, fallback_fraction * 100,
-            )
-            _plot(
-                title="Valley Threshold (fallback: no peaks after retries)",
+                smoothed,
+                peaks_all,
+                valley_idx=None,
                 threshold=fallback,
-                peaks_arr=np.array([], dtype=int),
-                curve=smoothed,
+                peak_a=peak_a,
+                title="Knee Threshold (fallback: insufficient points)",
             )
-            return fallback
+        return float(np.clip(fallback, 0.0, 1.0))
 
-    # 1b) If more than two peaks remain, iteratively trim the bottom 2% of the
-    #     intensity range until only two peaks are left (up to 5 attempts).
-    if len(peaks_all) > 2:
-        logger.warning(
-            "Valley threshold: %d peaks found - trimming bottom 2%% iteratively "
-            "to reduce to two peaks (up to 5 attempts)",
-            len(peaks_all),
-        )
-        _active_voxels = voxels
-        for _attempt in range(1, 6):
-            _clip_pct = _attempt * 2
-            _low = float(np.percentile(_active_voxels, 2))
-            _active_voxels = _active_voxels[_active_voxels > _low]
+    # Work in a normalized coordinate system on [0, 1]
+    x = np.linspace(0.0, 1.0, n)
+    y = np.asarray(smoothed, dtype=float)
 
-            if _active_voxels.size == 0:
-                logger.warning(
-                    "Valley threshold peak-reduction retry %d/%d: no voxels remain "
-                    "after trimming bottom %d%% - stopping early",
-                    _attempt, 5, _clip_pct,
-                )
-                break
+    peak_a = int(np.clip(peak_a, 0, n - 1))
+    x_r = x[peak_a:]
+    y_r = y[peak_a:]
 
-            _active_counts, _active_edges = np.histogram(_active_voxels, bins=nbins)
-            _active_centres = (_active_edges[:-1] + _active_edges[1:]) / 2.0
-            _active_smoothed = gaussian_filter1d(
-                _active_counts.astype(np.float64), sigma=smooth_sigma
-            )
-            peaks_all, props_all = _find_peaks(_active_smoothed, prom_frac=0.05)
+    logger.info(
+        "Knee threshold: finding elbow on right slope of peak_a @ normalized x=%.4f",
+        float(x[peak_a]),
+    )
 
-            logger.info(
-                "Valley threshold peak-reduction retry %d/%d: %d peak(s) remain "
-                "after trimming bottom %d%% (intensity floor raised to %.4f)",
-                _attempt, 5, len(peaks_all), _clip_pct, _low,
-            )
+    threshold: float | None = None
 
-            if len(peaks_all) <= 2:
-                bin_centres = _active_centres
-                smoothed = _active_smoothed
-                counts = _active_counts
-                break
+    if len(y_r) >= 4:
+        # Chord from start of descending branch to the tail
+        x0, y0 = float(x_r[0]), float(y_r[0])
+        x1, y1 = float(x_r[-1]), float(y_r[-1])
 
-        if len(peaks_all) > 2:
-            logger.warning(
-                "Valley threshold: still %d peaks after 5 reduction attempts - "
-                "proceeding with the two most prominent",
-                len(peaks_all),
-            )
-            top2 = np.argsort(props_all["prominences"])[-2:]
-            peaks_all = peaks_all[np.sort(top2)]
-            props_all = {k: v[np.sort(top2)] for k, v in props_all.items()}
+        dx = x1 - x0
+        dy = y1 - y0
+        denom = float(np.hypot(dx, dy))
 
-    main_idx = int(np.argmax(props_all["prominences"]))
-    peak_a = int(peaks_all[main_idx])
+        if denom > 0.0:
+            # Perpendicular distance from each point to the chord
+            dist = np.abs(dy * (x_r - x0) - dx * (y_r - y0)) / denom
 
-    # 2a) Knee strategy: find where the right slope of peak_a flattens and return.
-    if strategy == "knee":
-        logger.info(
-            "Valley threshold: strategy='knee' - finding right-slope knee of peak_a @ %.4f",
-            float(bin_centres[peak_a]),
-        )
-        _right_curve = smoothed[peak_a:]
-        _right_centres = bin_centres[peak_a:]
-        _threshold_from_slope: float | None = None
+            # Prefer the descending part of the curve to avoid odd bumps
+            slope = np.gradient(y_r, x_r)
+            valid = np.isfinite(dist) & np.isfinite(slope) & (slope <= 0)
 
-        if len(_right_curve) >= 4:
-            _grad1 = np.gradient(_right_curve)
-            _grad2 = np.gradient(_grad1)
-            _sign_diff = np.diff(np.sign(_grad2[1:]))
-            _crossings = np.where(_sign_diff > 0)[0] + 2
-            if len(_crossings) > 0:
-                _search_start = int(_crossings[0])
-                _g1_tail = _grad1[_search_start:]
-                _g2_tail = _grad2[_search_start:]
-                _flat_local = _search_start + int(
-                    np.argmax(_g2_tail) if conservative else np.argmin(_g2_tail)
-                )
-                _flat_local = min(_flat_local, len(_right_centres) - 1)
-                _threshold_from_slope = float(_right_centres[_flat_local])
+            if np.any(valid):
+                masked_dist = np.where(valid, dist, -np.inf)
+                knee_local = int(np.argmax(masked_dist))
+                threshold = float(x_r[knee_local])
+
                 logger.info(
-                    "Valley threshold (knee): right-slope knee at intensity %.4f "
-                    "(grad1=%.4g, grad2=%.4g, bin index %d from peak_a)",
-                    _threshold_from_slope,
-                    float(_g1_tail[_flat_local - _search_start]),
-                    float(_g2_tail[_flat_local - _search_start]),
-                    _flat_local,
+                    "Knee threshold: max distance at normalized x=%.4f "
+                    "(dist=%.4g, y=%.4g, local index %d from peak_a)",
+                    threshold,
+                    float(dist[knee_local]),
+                    float(y_r[knee_local]),
+                    knee_local,
                 )
             else:
-                logger.warning("Valley threshold (knee): no inflection found on right slope")
-
-        if _threshold_from_slope is None or _threshold_from_slope <= 0.0:
+                logger.warning(
+                    "Knee threshold: no valid descending-slope points found; using fallback"
+                )
+        else:
             logger.warning(
-                "Valley threshold (knee): slope-flattening failed - "
-                "falling back to %.4f (%.0f%% of ROI max)",
-                fallback, fallback_fraction * 100,
+                "Knee threshold: chord length is zero; using fallback"
             )
-            _plot(
-                title="Valley Threshold knee (fallback: slope failed)",
-                threshold=fallback,
-                peak_a=peak_a,
-                peaks_arr=peaks_all,
-                curve=smoothed,
-            )
-            return fallback
 
-        _plot(
-            title="Valley Threshold (knee)",
-            threshold=_threshold_from_slope,
-            peak_a=peak_a,
-            peaks_arr=peaks_all,
-            curve=smoothed,
+    if threshold is None or not np.isfinite(threshold):
+        logger.warning(
+            "Knee threshold: falling back to %.4f (%.0f%% of ROI max)",
+            fallback,
+            fallback_fraction * 100,
         )
-        return _threshold_from_slope
+        threshold = float(np.clip(fallback, 0.0, 1.0))
 
-    # 2b) Valley strategy: search for the second peak only on the right side.
+    threshold = float(np.clip(threshold, 0.0, 1.0))
+
+    if debug:
+        _plot_valley_histogram(
+            bin_centres,
+            counts,
+            smoothed,
+            peaks_all,
+            valley_idx=None,
+            threshold=threshold,
+            peak_a=peak_a,
+            title="Knee Threshold",
+        )
+
+    return threshold
+
+def _threshold_valley(
+    bin_centres: np.ndarray,
+    smoothed: np.ndarray,
+    counts: np.ndarray,
+    peak_a: int,
+    peaks_all: np.ndarray,
+    fallback: float,
+    fallback_fraction: float,
+    debug: bool,
+    second_peak_min_sep: float,
+    second_peak_prom_frac: float,
+    bias: float,
+) -> float:
+    """
+    Return the intensity at the valley between ``peak_a`` and the next
+    prominent peak to its right, optionally shifted by ``bias``.
+    """
     x_a = float(bin_centres[peak_a])
     right_mask = bin_centres >= (x_a + second_peak_min_sep)
 
@@ -422,40 +418,35 @@ def find_threshold(
             "Valley threshold: no right-side search region - falling back to %.4f",
             fallback,
         )
-        _plot(
-            title="Valley Threshold (fallback: no right-side region)",
-            threshold=fallback,
-            peak_a=peak_a,
-            peaks_arr=peaks_all,
-            curve=smoothed,
-        )
+        if debug:
+            _plot_valley_histogram(
+                bin_centres, counts, smoothed, peaks_all,
+                valley_idx=None, threshold=fallback,
+                peak_a=peak_a, title="Valley Threshold (fallback: no right-side region)",
+            )
         return fallback
 
-    right_curve = smoothed[right_mask]
-    right_x = bin_centres[right_mask]
-
-    peaks_right, props_right = _find_peaks(right_curve, prom_frac=second_peak_prom_frac)
+    peaks_right, props_right = _find_histogram_peaks(
+        smoothed[right_mask], prom_frac=second_peak_prom_frac
+    )
 
     if len(peaks_right) == 0:
         logger.warning(
-            "Valley threshold (valley): no secondary peak found - "
+            "Valley threshold: no secondary peak found - "
             "falling back to %.4f (%.0f%% of ROI max)",
             fallback, fallback_fraction * 100,
         )
-        _plot(
-            title="Valley Threshold (fallback: no secondary peak)",
-            threshold=fallback,
-            peak_a=peak_a,
-            peaks_arr=peaks_all,
-            curve=smoothed,
-        )
+        if debug:
+            _plot_valley_histogram(
+                bin_centres, counts, smoothed, peaks_all,
+                valley_idx=None, threshold=fallback,
+                peak_a=peak_a, title="Valley Threshold (fallback: no secondary peak)",
+            )
         return fallback
 
-    # Pick the tallest peak in the right-side region.
     second_local_idx = int(peaks_right[np.argmax(props_right["prominences"])])
     peak_b = int(np.flatnonzero(right_mask)[second_local_idx])
 
-    # 3) Valley is the minimum between the two peak centers.
     search_left = min(peak_a, peak_b)
     search_right = max(peak_a, peak_b)
 
@@ -464,14 +455,13 @@ def find_threshold(
             "Valley threshold: degenerate peak spacing - falling back to %.4f",
             fallback,
         )
-        _plot(
-            title="Valley Threshold (fallback: degenerate spacing)",
-            threshold=fallback,
-            peak_a=peak_a,
-            peak_b=peak_b,
-            peaks_arr=peaks_all,
-            curve=smoothed,
-        )
+        if debug:
+            _plot_valley_histogram(
+                bin_centres, counts, smoothed, peaks_all,
+                valley_idx=None, threshold=fallback,
+                peak_a=peak_a, peak_b=peak_b,
+                title="Valley Threshold (fallback: degenerate spacing)",
+            )
         return fallback
 
     valley_rel = int(np.argmin(smoothed[search_left:search_right + 1]))
@@ -485,16 +475,6 @@ def find_threshold(
         bin_centres[peak_a], bin_centres[peak_b], threshold,
     )
 
-    _plot(
-        title="Valley Threshold",
-        threshold=threshold,
-        peak_a=peak_a,
-        peak_b=peak_b,
-        valley_idx=valley_idx,
-        peaks_arr=np.array([peak_a, peak_b], dtype=int),
-        curve=smoothed,
-    )
-
     if threshold <= 0.0 or not np.isfinite(threshold):
         logger.warning(
             "Valley threshold invalid (%.4f) - falling back to %.4f",
@@ -502,7 +482,176 @@ def find_threshold(
         )
         return fallback
 
+    if debug:
+        _plot_valley_histogram(
+            bin_centres, counts, smoothed,
+            np.array([peak_a, peak_b], dtype=int),
+            valley_idx=valley_idx, threshold=threshold,
+            peak_a=peak_a, peak_b=peak_b, title="Valley Threshold",
+        )
     return threshold
+
+
+def find_threshold(
+    volume: np.ndarray,
+    middle_fraction: float = 0.25,
+    nbins: int = 128,
+    smooth_sigma: float = 2.25,
+    fallback_fraction: float = 0.38,
+    debug: bool = False,
+    second_peak_min_sep: float = 0.08,
+    second_peak_prom_frac: float = 0.01,
+    bias: float = -0.45,
+    strategy: Literal["valley", "knee"] = "valley",
+) -> float:
+    """
+    Find a threshold separating background from bone.
+
+    Extracts a central ROI from the volume, builds a smoothed histogram,
+    resolves the dominant peak (with retries if needed), then delegates to
+    ``_threshold_knee`` or ``_threshold_valley`` depending on ``strategy``.
+
+    Parameters
+    ----------
+    second_peak_min_sep:
+        Minimum intensity separation (in histogram x-units) before searching
+        for the second peak.  Valley strategy only.
+    second_peak_prom_frac:
+        Relative prominence threshold for the secondary-peak search, as a
+        fraction of the global smoothed-histogram maximum.  Valley strategy only.
+    bias:
+        Fractional shift of the threshold toward the bone peak.
+        0 = valley minimum; 1 = bone peak; negative = toward background.
+        Valley strategy only.
+    strategy:
+        ``"valley"`` places the threshold at the valley between the two
+        dominant histogram peaks.
+        ``"knee"`` uses the point of maximum curvature on the right
+        descending slope of the dominant peak.
+    """
+    depth = volume.shape[0]
+    half = max(1, int(depth * middle_fraction / 2))
+    mid = depth // 2
+    start = max(0, mid - half)
+    end = min(depth, mid + half)
+    roi = volume[start:end]
+
+    logger.info(
+        "find_threshold ROI: slices %d-%d (%d slices, %.0f%% of volume)",
+        start, end, roi.shape[0], middle_fraction * 100,
+    )
+
+    voxels = roi[roi > 0]
+    if voxels.size == 0:
+        logger.warning("find_threshold: no nonzero voxels in ROI - returning 0")
+        return 0.0
+
+    counts, edges = np.histogram(voxels, bins=nbins)
+    bin_centres = (edges[:-1] + edges[1:]) / 2.0
+    smoothed = gaussian_filter1d(counts.astype(np.float64), sigma=smooth_sigma)
+    fallback = float(voxels.max() * fallback_fraction)
+
+    # --- Peak finding with zero-peak retry loop ---
+    peaks_all, props_all = _find_histogram_peaks(smoothed, prom_frac=0.05)
+
+    if len(peaks_all) == 0:
+        logger.warning(
+            "find_threshold: no peaks on first pass"
+        )
+        for _attempt in range(1, 21):
+            _pct = _attempt * 5  # 5%, 10%, ..., 100% of original distribution
+            _low = float(np.percentile(voxels, _pct))
+            _active_voxels = voxels[voxels > _low]
+            if _active_voxels.size == 0:
+                logger.warning(
+                    "retry %d/20: no voxels remain - stopping early",
+                    _attempt,
+                )
+                break
+            _c, _e = np.histogram(_active_voxels, bins=nbins)
+            _bc = (_e[:-1] + _e[1:]) / 2.0
+            _sm = gaussian_filter1d(_c.astype(np.float64), sigma=smooth_sigma)
+            peaks_all, props_all = _find_histogram_peaks(_sm, prom_frac=0.05)
+            if len(peaks_all) > 0:
+                logger.info(
+                    "retry %d/20: found %d peak(s) "
+                    "(intensity floor raised to %.4f, %d%% percentile of original)",
+                    _attempt, len(peaks_all), _low, _pct,
+                )
+                bin_centres, smoothed, counts = _bc, _sm, _c
+                break
+            logger.warning(
+                "retry %d/20: still no peaks "
+                "(floor raised to %.4f, %d%% percentile of original)",
+                _attempt, _low, _pct,
+            )
+
+    if len(peaks_all) == 0:
+        logger.warning(
+            "find_threshold: no peaks after retries - "
+            "falling back to %.4f (%.0f%% of ROI max)",
+            fallback, fallback_fraction * 100,
+        )
+        if debug:
+            _plot_valley_histogram(
+                bin_centres, counts, smoothed, np.array([], dtype=int),
+                valley_idx=None, threshold=fallback,
+                title="find_threshold (fallback: no peaks after retries)",
+            )
+        return fallback
+
+    # --- >2-peak reduction loop ---
+    if len(peaks_all) > 2:
+        logger.warning(
+            "find_threshold: %d peaks found - stepping through 5%% percentile "
+            "intervals to reduce to two (up to 20 attempts)",
+            len(peaks_all),
+        )
+        for _attempt in range(1, 21):
+            _pct = _attempt * 5  # 5%, 10%, ..., 100% of original distribution
+            _low = float(np.percentile(voxels, _pct))
+            _active_voxels = voxels[voxels > _low]
+            if _active_voxels.size == 0:
+                logger.warning(
+                    "find_threshold peak-reduction retry %d/20: no voxels remain",
+                    _attempt,
+                )
+                break
+            _c, _e = np.histogram(_active_voxels, bins=nbins)
+            _bc = (_e[:-1] + _e[1:]) / 2.0
+            _sm = gaussian_filter1d(_c.astype(np.float64), sigma=smooth_sigma)
+            peaks_all, props_all = _find_histogram_peaks(_sm, prom_frac=0.05)
+            logger.info(
+                "find_threshold peak-reduction retry %d/20: %d peak(s) remain "
+                "(intensity floor raised to %.4f, %d%% percentile of original)",
+                _attempt, len(peaks_all), _low, _pct,
+            )
+            if len(peaks_all) <= 2:
+                bin_centres, smoothed, counts = _bc, _sm, _c
+                break
+
+        if len(peaks_all) > 2:
+            logger.warning(
+                "find_threshold: still %d peaks after 20 attempts - "
+                "keeping the two most prominent",
+                len(peaks_all),
+            )
+            top2 = np.argsort(props_all["prominences"])[-2:]
+            peaks_all = peaks_all[np.sort(top2)]
+            props_all = {k: v[np.sort(top2)] for k, v in props_all.items()}
+
+    peak_a = int(peaks_all[np.argmax(props_all["prominences"])])
+
+    if strategy == "knee":
+        return _threshold_knee(
+            bin_centres, smoothed, counts,
+            peak_a, peaks_all, fallback, fallback_fraction, debug,
+        )
+    return _threshold_valley(
+        bin_centres, smoothed, counts,
+        peak_a, peaks_all, fallback, fallback_fraction, debug,
+        second_peak_min_sep, second_peak_prom_frac, bias,
+    )
 
 
 def _plot_valley_histogram(

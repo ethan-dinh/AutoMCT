@@ -110,12 +110,14 @@ def main() -> None:
 
     out_root = str(pathlib.Path(args.out or "segmentation_results").resolve())
 
+    _VOLUME_EXTS = {".nrrd", ".tif", ".tiff"}
     samples = sorted(
         name for name in os.listdir(data_dir)
-        if os.path.isdir(data_dir / name) and name != "Compressed"
+        if (os.path.isdir(data_dir / name) and name != "Compressed")
+        or pathlib.Path(name).suffix.lower() in _VOLUME_EXTS
     )
     if not samples:
-        print(f"[INFO] No sample sub-folders found under {data_dir}")
+        print(f"[INFO] No samples found under {data_dir} (looked for sub-folders and {', '.join(_VOLUME_EXTS)} files)")
         sys.exit(0)
 
     # -----------------------------------------------------------------------
