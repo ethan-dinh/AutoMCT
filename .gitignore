@@ -33,7 +33,7 @@ cli_test_results.json
 /segment_mandible/tests/segmentation_results/
 
 # Ignore cache files
-*/.det_cache/
+**/.det_cache/
 
 # Ignore training files
 */training/
