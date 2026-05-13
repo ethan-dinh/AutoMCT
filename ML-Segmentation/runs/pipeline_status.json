@@ -1,7 +1,7 @@
 {
-  "status": "complete",
-  "pid": 24980,
-  "started_at": "2026-05-10T15:42:16.363986",
+  "status": "running",
+  "pid": 372,
+  "started_at": "2026-05-11T15:24:36.321460",
   "folds_planned": [
     0,
     1,
@@ -15,33 +15,25 @@
   ],
   "folds_complete": [
     0,
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8
+    1
   ],
   "folds_skipped": [],
-  "current_fold": 8,
-  "current_epoch": 260,
+  "current_fold": 2,
+  "current_epoch": 290,
   "total_epochs": 500,
   "timing": {
-    "preload_s": 116.4,
-    "fold_elapsed_s": 3933.9,
-    "avg_epoch_s": 43.71,
-    "eta_fold_s": 10490.0,
-    "elapsed_total_s": 33551.1,
-    "total_s": 33555.6
+    "preload_s": 0.1,
+    "fold_elapsed_s": 28574.9,
+    "avg_epoch_s": 98.53,
+    "eta_fold_s": 20692.0,
+    "elapsed_total_s": 79215.1
   },
-  "best_dice_fold": 0.6107,
-  "last_val_dice": 0.5918,
+  "best_dice_fold": 0.8753,
+  "last_val_dice": 0.8434,
   "last_per_class": {
-    "incisor": 0.6631,
-    "bone": 0.7902,
-    "molar": 0.322
+    "incisor": 0.8789,
+    "bone": 0.9023,
+    "molar": 0.7491
   },
-  "updated_at": "2026-05-11T01:01:32.104867"
+  "updated_at": "2026-05-12T13:24:51.900859"
 }
