@@ -4,11 +4,15 @@ Mandible segmentation pipeline: loads raw data and returns segmented volumes.
 
 import gc
 import glob
+import glob
 import logging
+import os
 import os
 
 import numpy as np
 
+from data_io import load_bmp_stack, load_nrrd, load_tiff
+from preprocessing import find_min_intensity_of_bone, find_threshold, non_local_means_filter, normalize_volume, reorient_mandible, tv_denoise_volume
 from data_io import load_bmp_stack, load_nrrd, load_tiff
 from preprocessing import find_min_intensity_of_bone, find_threshold, non_local_means_filter, normalize_volume, reorient_mandible, tv_denoise_volume
 from segmentation import segment_incisor, segment_molar_bone
@@ -79,7 +83,44 @@ def segment_mandible(
         else:
             logger.error("Unsupported input path: %s", input_path)
             return None
+        if input_path.endswith(".nrrd"):
+            bmp_data = load_nrrd(input_path)
+            if bmp_data is None:
+                logger.error("Failed to load NRRD file: %s", input_path)
+                return None
+        elif input_path.endswith((".tif", ".tiff")):
+            bmp_data = load_tiff(input_path)
+            if bmp_data is None:
+                logger.error("Failed to load TIFF file: %s", input_path)
+                return None
+        elif os.path.isdir(input_path):
+            # Check what files are inside the directory
+            nrrd_files = glob.glob(os.path.join(input_path, "*.nrrd"))
+            tif_files = glob.glob(os.path.join(input_path, "*.tif")) + glob.glob(os.path.join(input_path, "*.tiff"))
+            bmp_files = glob.glob(os.path.join(input_path, "*.bmp"))
+
+            if nrrd_files:
+                bmp_data = load_nrrd(nrrd_files[0])
+                if bmp_data is None:
+                    logger.error("Failed to load NRRD file: %s", nrrd_files[0])
+                    return None
+            elif tif_files:
+                bmp_data = load_tiff(tif_files[0])
+                if bmp_data is None:
+                    logger.error("Failed to load TIFF file: %s", tif_files[0])
+                    return None
+            elif bmp_files:
+                bmp_data = load_bmp_stack(
+                    input_path, file_pattern="*.bmp", exclude_pattern="*spr.bmp"
+                )
+            else:
+                logger.error("No supported files (.nrrd, .tif, .tiff, .bmp) found in %s", input_path)
+                return None
+        else:
+            logger.error("Unsupported input path: %s", input_path)
+            return None
     except Exception as e:
+        logger.error("Error loading input data: %s", e)
         logger.error("Error loading input data: %s", e)
         return None
 
@@ -109,8 +150,21 @@ def segment_mandible(
             strategy="knee", 
             debug=debug
         )
+        logger.info("Finding threshold between background and bone peaks")
+        bg_bone_valley = find_threshold(
+            normalized_volume,
+            strategy="knee", 
+            debug=debug
+        )
 
         logger.info("Determining conservative threshold for incisor isolation")
+        conservative_threshold = find_threshold(
+            normalized_volume, 
+            debug=debug,
+            strategy="valley",
+            fallback_fraction=0.38,
+            bias=0.4
+        )
         conservative_threshold = find_threshold(
             normalized_volume, 
             debug=debug,

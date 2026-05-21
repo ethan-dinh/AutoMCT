@@ -6,6 +6,8 @@ bridge cutting, and bone intensity estimation.
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal, Optional
 
 import numpy as np
@@ -19,6 +21,7 @@ from skimage.morphology import (
 )
 from skimage.segmentation import clear_border
 from skimage.morphology import erosion as bin_erode2d
+from tqdm import tqdm
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -424,8 +427,17 @@ def _threshold_valley(
                 valley_idx=None, threshold=fallback,
                 peak_a=peak_a, title="Valley Threshold (fallback: no right-side region)",
             )
+        if debug:
+            _plot_valley_histogram(
+                bin_centres, counts, smoothed, peaks_all,
+                valley_idx=None, threshold=fallback,
+                peak_a=peak_a, title="Valley Threshold (fallback: no right-side region)",
+            )
         return fallback
 
+    peaks_right, props_right = _find_histogram_peaks(
+        smoothed[right_mask], prom_frac=second_peak_prom_frac
+    )
     peaks_right, props_right = _find_histogram_peaks(
         smoothed[right_mask], prom_frac=second_peak_prom_frac
     )
@@ -433,9 +445,16 @@ def _threshold_valley(
     if len(peaks_right) == 0:
         logger.warning(
             "Valley threshold: no secondary peak found - "
+            "Valley threshold: no secondary peak found - "
             "falling back to %.4f (%.0f%% of ROI max)",
             fallback, fallback_fraction * 100,
         )
+        if debug:
+            _plot_valley_histogram(
+                bin_centres, counts, smoothed, peaks_all,
+                valley_idx=None, threshold=fallback,
+                peak_a=peak_a, title="Valley Threshold (fallback: no secondary peak)",
+            )
         if debug:
             _plot_valley_histogram(
                 bin_centres, counts, smoothed, peaks_all,
@@ -455,6 +474,13 @@ def _threshold_valley(
             "Valley threshold: degenerate peak spacing - falling back to %.4f",
             fallback,
         )
+        if debug:
+            _plot_valley_histogram(
+                bin_centres, counts, smoothed, peaks_all,
+                valley_idx=None, threshold=fallback,
+                peak_a=peak_a, peak_b=peak_b,
+                title="Valley Threshold (fallback: degenerate spacing)",
+            )
         if debug:
             _plot_valley_histogram(
                 bin_centres, counts, smoothed, peaks_all,
@@ -482,6 +508,13 @@ def _threshold_valley(
         )
         return fallback
 
+    if debug:
+        _plot_valley_histogram(
+            bin_centres, counts, smoothed,
+            np.array([peak_a, peak_b], dtype=int),
+            valley_idx=valley_idx, threshold=threshold,
+            peak_a=peak_a, peak_b=peak_b, title="Valley Threshold",
+        )
     if debug:
         _plot_valley_histogram(
             bin_centres, counts, smoothed,

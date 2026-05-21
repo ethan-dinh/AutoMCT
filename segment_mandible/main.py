@@ -7,8 +7,6 @@ import logging
 import os
 import pathlib
 
-import numpy as np
-
 from data_io import load_bmp_stack, load_tiff, save_ct_volume_as_tiff, save_mask_as_tiff
 from pipeline import segment_mandible
 from visualization import create_3d_visualization
@@ -124,7 +122,7 @@ def main() -> None:
         if result is None:
             continue
 
-        bmp_data, preprocessed, incisor, bone, molar, molar_labels = result
+        bmp_data, preprocessed, incisor, bone, molar = result
 
         volumes_dir = os.path.join(dir_name, "volumes")
         masks_dir   = os.path.join(dir_name, "masks")
@@ -134,9 +132,6 @@ def main() -> None:
             save_ct_volume_as_tiff(incisor,  volumes_dir, "incisor_volume",    base_dir=out_root)
             save_ct_volume_as_tiff(bone,     volumes_dir, "bone_volume",       base_dir=out_root)
             save_ct_volume_as_tiff(molar,    volumes_dir, "molar_volume",      base_dir=out_root)
-            for lbl in range(1, int(molar_labels.max()) + 1):
-                molar_instance = np.where(molar_labels == lbl, bmp_data, 0)
-                save_ct_volume_as_tiff(molar_instance, volumes_dir, f"molar_{lbl}_volume", base_dir=out_root)
             save_mask_as_tiff(incisor > 0, masks_dir, "incisor_mask", base_dir=out_root)
             save_mask_as_tiff(bone   > 0, masks_dir, "bone_mask",    base_dir=out_root)
             save_mask_as_tiff(molar  > 0, masks_dir, "molar_mask",   base_dir=out_root)
@@ -145,16 +140,14 @@ def main() -> None:
             logging.error("Error saving volumes: %s", e)
 
         if args.visualize:
-            _molar_colors = ["cyan", "magenta", "yellow"]
-            molar_layers = {
-                "Incisor": (incisor, "orange"),
-                "Bone":    (bone,    "grey"),
-                "Molar":   (molar,   "cyan"),
-            }
-            for lbl in range(1, int(molar_labels.max()) + 1):
-                color = _molar_colors[lbl - 1] if lbl <= len(_molar_colors) else "cyan"
-                molar_layers[f"Molar {lbl}"] = (np.where(molar_labels == lbl, molar, 0), color)
-            create_3d_visualization(preprocessed, additional_volumes=molar_layers)
+            create_3d_visualization(
+                preprocessed,
+                additional_volumes={
+                    "Incisor": (incisor, "orange"),
+                    "Bone":    (bone,    "grey"),
+                    "Molar":   (molar,   "cyan"),
+                },
+            )
 
 
 if __name__ == "__main__":
