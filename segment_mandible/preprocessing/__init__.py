@@ -5,6 +5,7 @@ from .filters import (
     tv_denoise_volume,
     rescale_to_unit,
     cut_bridges_slice,
+    clahe_volume,
     find_min_intensity_of_bone,
     find_threshold,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "tv_denoise_volume",
     "rescale_to_unit",
     "cut_bridges_slice",
+    "clahe_volume",
     "find_min_intensity_of_bone",
     "find_threshold",
     "reorient_mandible",

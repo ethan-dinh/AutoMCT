@@ -168,7 +168,4 @@ def segment_incisor(
     incisor_label = get_largest_region(incisor_volume)
     incisor_mask = (incisor_volume == incisor_label)
 
-    # logger.info("Dilating incisor mask to recover thin structures")
-    # incisor_mask = dilate_mask(incisor_mask, radius=2, if_2d=False)
-
     return incisor_mask.astype(bool)

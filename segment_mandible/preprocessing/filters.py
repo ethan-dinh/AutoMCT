@@ -6,8 +6,6 @@ bridge cutting, and bone intensity estimation.
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal, Optional
 
 import numpy as np
@@ -15,13 +13,12 @@ from scipy.ndimage import binary_fill_holes, distance_transform_edt, gaussian_fi
 from scipy.signal import find_peaks
 from skimage.morphology import (
     disk,
+    erosion as bin_erode2d,
     reconstruction as recon2d,
     remove_small_objects,
     skeletonize,
 )
 from skimage.segmentation import clear_border
-from skimage.morphology import erosion as bin_erode2d
-from tqdm import tqdm
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -131,7 +128,7 @@ def non_local_means_filter(
 def tv_denoise_volume(
     volume: np.ndarray,
     *,
-    weight: float = 0.05,
+    weight: float = 0.075,
     n_jobs: Optional[int] = None,
 ) -> np.ndarray:
     """
@@ -167,6 +164,59 @@ def tv_denoise_volume(
             for future in as_completed(futures):
                 i, denoised = future.result()
                 result[i] = denoised
+                pbar.update(1)
+
+    return result
+
+
+# ------------------------------------------------------------------
+# CLAHE contrast enhancement
+# ------------------------------------------------------------------
+
+def clahe_volume(
+    volume: np.ndarray,
+    *,
+    clip_limit: float = 0.01,
+    nbins: int = 256,
+    n_jobs: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) slice-by-slice.
+
+    Enhances local contrast without amplifying noise globally. Useful before
+    incisor segmentation to sharpen the intensity difference between the dense
+    incisor tip and surrounding bone — giving Otsu a cleaner bimodal histogram.
+
+    The input is expected to be float32 in [0, 1]. Output is float32 in [0, 1].
+
+    Parameters:
+        clip_limit: Contrast limiting threshold (fraction of the histogram peak).
+                    Lower values = less contrast boost. Typical range: 0.005–0.03.
+        nbins: Number of histogram bins used internally by CLAHE.
+        n_jobs: Parallel threads. None uses all available CPUs.
+    """
+    from skimage.exposure import equalize_adapthist
+
+    volume = volume.astype(np.float32)
+    workers = n_jobs if n_jobs is not None else os.cpu_count()
+    logger.info(
+        "Applying CLAHE (clip_limit=%.4f, nbins=%d, n_jobs=%d)",
+        clip_limit, nbins, workers,
+    )
+
+    result = np.empty_like(volume)
+
+    def _clahe_slice(i: int) -> tuple[int, np.ndarray]:
+        sl = volume[i]
+        enhanced = equalize_adapthist(sl, nbins=nbins, clip_limit=clip_limit)
+        return i, enhanced.astype(np.float32)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_clahe_slice, i): i for i in range(volume.shape[0])}
+        with tqdm(total=volume.shape[0], desc="Applying CLAHE") as pbar:
+            for future in as_completed(futures):
+                i, enhanced = future.result()
+                result[i] = enhanced
                 pbar.update(1)
 
     return result
@@ -427,34 +477,17 @@ def _threshold_valley(
                 valley_idx=None, threshold=fallback,
                 peak_a=peak_a, title="Valley Threshold (fallback: no right-side region)",
             )
-        if debug:
-            _plot_valley_histogram(
-                bin_centres, counts, smoothed, peaks_all,
-                valley_idx=None, threshold=fallback,
-                peak_a=peak_a, title="Valley Threshold (fallback: no right-side region)",
-            )
         return fallback
 
-    peaks_right, props_right = _find_histogram_peaks(
-        smoothed[right_mask], prom_frac=second_peak_prom_frac
-    )
     peaks_right, props_right = _find_histogram_peaks(
         smoothed[right_mask], prom_frac=second_peak_prom_frac
     )
 
     if len(peaks_right) == 0:
         logger.warning(
-            "Valley threshold: no secondary peak found - "
-            "Valley threshold: no secondary peak found - "
-            "falling back to %.4f (%.0f%% of ROI max)",
+            "Valley threshold: no secondary peak found - falling back to %.4f (%.0f%% of ROI max)",
             fallback, fallback_fraction * 100,
         )
-        if debug:
-            _plot_valley_histogram(
-                bin_centres, counts, smoothed, peaks_all,
-                valley_idx=None, threshold=fallback,
-                peak_a=peak_a, title="Valley Threshold (fallback: no secondary peak)",
-            )
         if debug:
             _plot_valley_histogram(
                 bin_centres, counts, smoothed, peaks_all,
@@ -474,13 +507,6 @@ def _threshold_valley(
             "Valley threshold: degenerate peak spacing - falling back to %.4f",
             fallback,
         )
-        if debug:
-            _plot_valley_histogram(
-                bin_centres, counts, smoothed, peaks_all,
-                valley_idx=None, threshold=fallback,
-                peak_a=peak_a, peak_b=peak_b,
-                title="Valley Threshold (fallback: degenerate spacing)",
-            )
         if debug:
             _plot_valley_histogram(
                 bin_centres, counts, smoothed, peaks_all,
@@ -515,13 +541,6 @@ def _threshold_valley(
             valley_idx=valley_idx, threshold=threshold,
             peak_a=peak_a, peak_b=peak_b, title="Valley Threshold",
         )
-    if debug:
-        _plot_valley_histogram(
-            bin_centres, counts, smoothed,
-            np.array([peak_a, peak_b], dtype=int),
-            valley_idx=valley_idx, threshold=threshold,
-            peak_a=peak_a, peak_b=peak_b, title="Valley Threshold",
-        )
     return threshold
 
 
@@ -534,7 +553,7 @@ def find_threshold(
     debug: bool = False,
     second_peak_min_sep: float = 0.08,
     second_peak_prom_frac: float = 0.01,
-    bias: float = -0.45,
+    bias: float = 0.4,
     strategy: Literal["valley", "knee"] = "valley",
 ) -> float:
     """

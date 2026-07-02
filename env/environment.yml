@@ -18,11 +18,14 @@ dependencies:
   - rich
   # Visualization
   - napari
+  - pyqt6
   # Build tools
   - pip
   - pip:
       # NRRD file I/O
       - pynrrd
+      # DICOM reading (used by tools/convert_DICOM_NRRD.py)
+      - pydicom>=2.4
       # Deep learning (ML-Segmentation module)
       # For GPU support, install PyTorch separately — see env/README.md
       - torch>=2.0

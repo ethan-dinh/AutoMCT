@@ -98,27 +98,43 @@ def main() -> None:
     parser.add_argument("--log", "-l", action="store_true", help="Enable coloured logging")
     parser.add_argument("--debug", "-d", action="store_true", help="Open napari viewer after every major pipeline step for inspection")
     parser.add_argument("--out", default=None, help="Output root (default: ./segmentation_results)")
+    parser.add_argument(
+        "--cache-dir", default=None,
+        help="Cache pre-molar-segmentation state here to skip loading/denoising/CLAHE/incisor "
+             "segmentation on reruns of the same sample — speeds up iterating on molar/bone "
+             "segmentation alone. Delete the directory to force a full rerun.",
+    )
     args = parser.parse_args()
 
     if args.log:
         setup_logging()
 
-    data_dir = pathlib.Path(args.data)
-    if not data_dir.exists():
-        print(f"[ERROR] Data directory not found: {data_dir}")
+    data_path = pathlib.Path(args.data)
+    if not data_path.exists():
+        print(f"[ERROR] Input path not found: {data_path}")
         sys.exit(1)
 
     out_root = str(pathlib.Path(args.out or "segmentation_results").resolve())
 
     _VOLUME_EXTS = {".nrrd", ".tif", ".tiff"}
-    samples = sorted(
-        name for name in os.listdir(data_dir)
-        if (os.path.isdir(data_dir / name) and name != "Compressed")
-        or pathlib.Path(name).suffix.lower() in _VOLUME_EXTS
-    )
-    if not samples:
-        print(f"[INFO] No samples found under {data_dir} (looked for sub-folders and {', '.join(_VOLUME_EXTS)} files)")
-        sys.exit(0)
+
+    if data_path.is_file():
+        # Single-file mode: treat the file itself as the only sample.
+        data_dir = data_path.parent
+        samples = [data_path.name]
+    else:
+        data_dir = data_path
+        samples = sorted(
+            name for name in os.listdir(data_dir)
+            if not name.startswith(".")
+            and (
+                (os.path.isdir(data_dir / name) and name != "Compressed")
+                or pathlib.Path(name).suffix.lower() in _VOLUME_EXTS
+            )
+        )
+        if not samples:
+            print(f"[INFO] No samples found under {data_dir} (looked for sub-folders and {', '.join(_VOLUME_EXTS)} files)")
+            sys.exit(0)
 
     # -----------------------------------------------------------------------
     # Outer loop — file selection
@@ -143,7 +159,7 @@ def main() -> None:
         while True:
             print(f"\n[INFO] Segmenting {pick} ...")
             try:
-                result = segment_mandible(sample_path, debug=args.debug)
+                result = segment_mandible(sample_path, debug=args.debug, cache_dir=args.cache_dir)
             except Exception:
                 print(f"[ERROR] Pipeline failed for {pick}:")
                 traceback.print_exc()

@@ -15,7 +15,7 @@ python main.py --input_path /path/to/samples [--log] [--visualize] [--debug] [--
 
 | Flag | Short | Description |
 |---|---|---|
-| `--input_path` | `-i` | Root directory containing one sub-folder per sample |
+| `--input_path` | `-i` | Path to a `.nrrd`/`.tif` file, or a root directory containing one sub-folder per sample |
 | `--log` | `-l` | Enable coloured console logging |
 | `--visualize` | `-v` | Open napari 3D viewer after each segmentation |
 | `--debug` | `-d` | Open napari viewer after every major pipeline step for inspection |
@@ -52,10 +52,7 @@ segmentation_results/
     ├── volumes/
     │   ├── incisor_volume.tif
     │   ├── bone_volume.tif
-    │   ├── molar_volume.tif
-    │   ├── molar_1_volume.tif
-    │   ├── molar_2_volume.tif
-    │   └── molar_3_volume.tif
+    │   └── molar_volume.tif
     └── masks/
         ├── incisor_mask.tif
         ├── bone_mask.tif
@@ -69,8 +66,12 @@ All volumes are saved as zlib-compressed BigTIFF. Masks are uint8 (0/1).
 An interactive TUI for per-sample inspection lives in `tests/`:
 
 ```bash
-python tests/test_pipeline.py --data /path/to/samples [--out /path/to/output] [--debug]
+python tests/run.py                                                    # native file/folder picker
+python tests/test_pipeline.py --data /path/to/file.nrrd [--out /path/to/output] [--debug]
+python tests/test_pipeline.py --data /path/to/samples   [--out /path/to/output] [--debug]
 ```
+
+`run.py` opens a small dialog asking whether you want to pick a **single volume file** (`.nrrd`, `.tif`, `.tiff`) or a **folder of samples**, then launches the TUI. Passing a single file directly to `test_pipeline.py` is also supported.
 
 After each segmentation, a napari viewer opens and a menu lets you **Accept** (save), **Re-segment**, **Skip**, or **Quit**. Requires the optional `questionary` package for a nicer menu (falls back to numbered prompts).
 
@@ -132,16 +133,27 @@ Input volume (BMP stack / NRRD / TIFF)
     │  Companion raw volume is co-transformed.
     │
     ▼
-[7] Conservative incisor isolation    pipeline.py
-    │  Re-threshold at the valley threshold (more aggressive).
+[7] CLAHE contrast enhancement        preprocessing/filters.py
+    │  clahe_volume()
+    │  Adaptive histogram equalization (clip_limit=0.01) applied
+    │  slice-by-slice to the preprocessed volume.
+    │  Amplifies local intensity differences between the dense
+    │  incisor tip and surrounding bone before Otsu thresholding.
+    │  Parallelized across CPU cores via ThreadPoolExecutor.
+    │  Only used as input to incisor segmentation — the raw
+    │  preprocessed volume is preserved for all other steps.
+    │
+    ▼
+[8] Conservative incisor isolation    pipeline.py
+    │  Re-threshold the CLAHE volume at the valley threshold (more aggressive).
     │  Segment incisor in this conservative volume.
     │  Remove the incisor, dilate + clean the remaining bone mask
     │  (slice-by-slice island removal, min 2500 voxels).
-    │  Subtract bone mask from the preprocessed volume to isolate
+    │  Subtract bone mask from the CLAHE volume to isolate
     │  the incisor region free of surrounding bone.
     │
     ▼
-[8] Incisor segmentation              segmentation/incisor.py
+[9] Incisor segmentation              segmentation/incisor.py
     │  segment_incisor()
     │  Iterates slices posterior → anterior:
     │    • Per-slice contrast stretch (percentile clip, p=10–98).
@@ -154,29 +166,29 @@ Input volume (BMP stack / NRRD / TIFF)
     │  Returns a boolean 3D mask.
     │
     ▼
-[9] Incisor removal                   pipeline.py
+[10] Incisor removal                  pipeline.py
     │  Dilate incisor mask (radius=2) and zero out from volume.
     │
     ▼
-[10] Bone + molar segmentation        segmentation/molar_bone.py
+[11] Bone + molar segmentation        segmentation/molar_bone.py
     │  segment_molar_bone()
-    │    • Gaussian blur (σ=1) + Otsu threshold per slice.
-    │    • Morphological closing (ball r=1).
-    │    • 3D connected-component labeling.
-    │    • Largest component → bone.
-    │    • Remaining components → molar candidates (discard < 50%
-    │      of largest molar component).
+    │  Primary — enamel-anchored region growing:
+    │    • After incisor removal, enamel (brightest tissue) only
+    │      exists in molars.
+    │    • Adaptively locate the enamel threshold: find the knee on
+    │      the descending slope of the dominant (bone) histogram
+    │      peak, then refit on the tail beyond it to locate the
+    │      enamel peak itself.
+    │    • Label enamel clusters; keep top N (≤ max_molars) by mean
+    │      intensity as one seed per tooth.
+    │    • Each seed is dilated (radius=2) then grown via binary
+    │      propagation into the full foreground, with thin bone
+    │      bridges cut beforehand so seeds can't leak between teeth.
+    │    • Foreground not reached by any seed → bone.
+    │  Fallback (if no enamel seeds found) — erosion-based:
+    │    • Iteratively erode foreground until ≥ 2 components appear.
+    │    • Highest max-intensity component → molar; rest → bone.
     │  Molar mask is dilated (radius=3) to capture porous structure.
-    │
-    ▼
-[11] Post-processing (optional)       segmentation/postprocessing.py
-    │  postprocess_incisor()
-    │    Iterative erosion to separate bone-attachment bridges,
-    │    then binary propagation to reconstruct the clean body.
-    │  split_molars()
-    │    Intensity-guided dentin seeding + EDT watershed to split
-    │    the fused molar mask into individual molar instances.
-    │    Falls back to EDT-peak seeding if intensity data unavailable.
     │
     ▼
 [12] Save & visualize                 data_io/loaders.py, visualization/viewers.py
@@ -203,7 +215,7 @@ segment_mandible/
 │   ├── __init__.py
 │   ├── filters.py           normalize_volume, gaussian_filter_volume,
 │   │                        non_local_means_filter, tv_denoise_volume,
-│   │                        rescale_to_unit, cut_bridges_slice,
+│   │                        clahe_volume, rescale_to_unit, cut_bridges_slice,
 │   │                        find_min_intensity_of_bone, find_threshold
 │   └── reorientation.py     reorient_mandible
 │
@@ -216,6 +228,7 @@ segment_mandible/
 │   ├── incisor.py           segment_incisor
 │   ├── molar_bone.py        segment_molar_bone
 │   └── postprocessing.py    postprocess_incisor, split_molars
+│                             (available helpers, not yet wired into pipeline.py)
 │
 ├── visualization/
 │   ├── __init__.py
