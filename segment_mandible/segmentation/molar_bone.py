@@ -2,13 +2,11 @@ import logging
 from typing import Optional
 
 import numpy as np
-from scipy.ndimage import binary_propagation, gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks, peak_widths
 from skimage.measure import label
 
-from preprocessing import cut_bridges_slice
 from segmentation.utils import (
-    dilate_mask,
     erode_mask,
     label_3d_volume,
 )
@@ -57,6 +55,7 @@ def _plot_enamel_threshold_histogram(
     ax.set_title("Foreground intensity histogram — enamel threshold")
     ax.legend()
     plt.show()
+    plt.close(fig)
 
 
 def _find_enamel_threshold(
@@ -203,173 +202,154 @@ def _filter_small_components(
     return filtered, int(valid_labels.size)
 
 
-def _enamel_seeds(
+def _bone_label(counts: np.ndarray) -> int:
+    """
+    Identify the bone component: the largest connected component by voxel
+    count. Bone is the easiest region to detect because it contains the
+    most voxels; molars are smaller connected components.
+    """
+    return int(np.argmax(counts))
+
+
+def _enamel_connected_to_bone(
+    enamel_mask: np.ndarray,
+    labeled_foreground: np.ndarray,
+    bone_label: int,
+) -> bool:
+    """True if any enamel voxel lies inside the bone component."""
+    return bool(np.any(labeled_foreground[enamel_mask] == bone_label))
+
+
+def _find_molar_separation_threshold(
     volume: np.ndarray,
-    foreground: np.ndarray,
-    min_seed_size: int,
-    max_molars: int,
-    debug: bool = False,
-) -> Optional[np.ndarray]:
+    enamel_mask: np.ndarray,
+    *,
+    min_component_size: int,
+    threshold_step: float,
+    max_iters: int,
+) -> tuple[np.ndarray, float, int]:
     """
-    Identify molar anchors from enamel clusters.
+    Escalate the foreground intensity threshold from 0 (the full foreground)
+    until every enamel-bearing component is disconnected from the bone
+    component (the largest component by voxel count).
 
-    After incisor removal, enamel only exists in molars. We adaptively
-    threshold the foreground at the knee beyond the dominant bone peak to
-    isolate candidate enamel voxels, label the resulting clusters, discard
-    any smaller than min_seed_size (noise speckles), then keep the top N
-    by mean intensity as seeds — one per molar. Ranking by brightness
-    rather than size matters because a large, merely-bright patch of bone
-    that crossed the threshold can otherwise outrank a smaller but truly
-    enamel-bright cluster.
+    Dentin and bone sit at overlapping intensities, so a single global
+    threshold either fuses molars to bone or cuts into real tissue. Enamel
+    is strictly brighter than both, so it can always be isolated cleanly --
+    this uses that asymmetry to find a working separation threshold instead
+    of building the molar mask directly off enamel.
 
-    Returns a label array (same shape as volume, dtype int32) with each enamel
-    seed cluster assigned a unique label 1..N, or None if fewer than 1 seed is
-    found.
+    Returns (labeled_foreground, threshold, n_iters) at the point of
+    disconnection -- bone is the largest component; every other large
+    component that contains enamel is a molar candidate.
     """
-    fg_vals = volume[foreground]
-    if fg_vals.size == 0:
-        return None
+    threshold = 0.0
 
-    enamel_thresh = _find_enamel_threshold(fg_vals, debug=debug)
+    for it in range(max_iters):
+        candidate = (volume > threshold) & (volume > 0)
+        labeled = label_3d_volume(candidate, connectivity=1)
+        counts = np.bincount(labeled.ravel())
+        counts[0] = 0
 
-    enamel_mask = foreground & (volume >= enamel_thresh)
-    if not enamel_mask.any():
-        logger.warning("No enamel voxels found above threshold — will fall back")
-        return None
+        if not counts.any():
+            logger.warning("Molar separation: threshold=%.4f -> empty foreground; stopping", threshold)
+            break
 
-    labeled_enamel, n = label(enamel_mask, connectivity=1, return_num=True)  # type: ignore
-    logger.info("Enamel clusters found: %d", n)
+        bone_lbl = _bone_label(counts)
+        still_connected = _enamel_connected_to_bone(enamel_mask, labeled, bone_lbl)
 
-    if n == 0:
-        return None
+        logger.info(
+            "Molar separation iter %3d: threshold=%.4f -> bone=%d voxels, "
+            "enamel connected to bone=%s",
+            it, threshold, int(counts[bone_lbl]), still_connected,
+        )
 
-    counts = np.bincount(labeled_enamel.ravel())
-    counts[0] = 0
+        if not still_connected:
+            logger.info(
+                "Enamel disconnected from bone after %d iteration(s) at threshold=%.4f",
+                it, threshold,
+            )
+            return labeled, threshold, it
 
-    candidate_labels = [lbl for lbl in range(1, n + 1) if counts[lbl] >= min_seed_size]
+        threshold += threshold_step
 
-    if len(candidate_labels) == 0:
-        logger.warning("No enamel clusters met the minimum size — will fall back")
-        return None
-
-    # Keep up to max_molars brightest clusters (by mean intensity) among
-    # those that passed the minimum-size filter.
-    mean_intensities = {
-        lbl: float(volume[labeled_enamel == lbl].mean()) for lbl in candidate_labels
-    }
-    top_labels = sorted(
-        candidate_labels, key=lambda lbl: mean_intensities[lbl], reverse=True
-    )[:max_molars]
-
-    logger.info(
-        "Enamel seeds selected: %d cluster(s), sizes %s, mean intensities %s",
-        len(top_labels),
-        [int(counts[l]) for l in top_labels],
-        [round(mean_intensities[l], 4) for l in top_labels],
+    logger.warning(
+        "Enamel never disconnected from bone after %d iterations; using last threshold %.4f",
+        max_iters, threshold,
     )
-
-    seeds = np.zeros(volume.shape, dtype=np.int32)
-    for new_lbl, old_lbl in enumerate(top_labels, start=1):
-        seeds[labeled_enamel == old_lbl] = new_lbl
-
-    return seeds
+    candidate = (volume > threshold) & (volume > 0)
+    labeled = label_3d_volume(candidate, connectivity=1)
+    return labeled, threshold, max_iters
 
 
-def _cut_foreground_bridges(foreground: np.ndarray) -> np.ndarray:
-    """
-    Sever thin bone bridges connecting molars to each other/the jaw, slice by
-    slice, so seeded propagation can't leak through a thin neck from a molar
-    into bone (or a neighboring molar).
-    """
-    cut = np.zeros_like(foreground)
-    for i in range(foreground.shape[0]):
-        sl = foreground[i]
-        if not sl.any():
-            continue
-        cut_slice = cut_bridges_slice(sl, strategy="reconstruct")
-        cut[i] = cut_slice if cut_slice is not None else sl
-    return cut
-
-
-def _grow_from_seeds(
-    seeds: np.ndarray,
-    foreground: np.ndarray,
+def _extract_molar_mask(
+    labeled_foreground: np.ndarray,
+    enamel_mask: np.ndarray,
+    *,
+    min_component_size: int,
 ) -> np.ndarray:
     """
-    Grow each seed label into the full foreground via binary propagation.
-
-    Each molar seed is grown independently so they compete for foreground
-    voxels. Foreground voxels not reached by any seed → bone.
-
-    Propagation is confined to a bridge-cut version of the foreground mask,
-    which severs the thin bone necks that would otherwise let a molar seed
-    flood into surrounding bone or a neighboring molar. Voxels trimmed away
-    by the bridge cut are re-added to whichever label reaches them via
-    dilation, so the final masks still cover the full original foreground.
-
-    Returns a label array with the same labels as seeds (0 = ungrown).
+    Given the disconnected labeling from _find_molar_separation_threshold,
+    return a boolean mask of every component that contains enamel and isn't
+    the bone component -- i.e. all molar candidates.
     """
-    n_seeds = int(seeds.max())
-    grown = np.zeros_like(seeds)
+    counts = np.bincount(labeled_foreground.ravel())
+    counts[0] = 0
+    if not counts.any():
+        return np.zeros_like(labeled_foreground, dtype=bool)
 
-    bridge_cut_foreground = _cut_foreground_bridges(foreground)
+    bone_lbl = _bone_label(counts)
+    large_labels = np.flatnonzero(counts >= min_component_size)
 
-    for lbl in range(1, n_seeds + 1):
-        seed_mask = seeds == lbl
-        # Dilate seed slightly before propagating to bridge thin enamel gaps.
-        seed_mask = dilate_mask(seed_mask, radius=2, if_2d=False)
-        grown_lbl = binary_propagation(
-            seed_mask,
-            mask=bridge_cut_foreground,
-            structure=np.ones((3, 3, 3), dtype=bool),
-        )
-        # Only claim voxels not already assigned to a prior seed.
-        unassigned = grown == 0
-        grown[grown_lbl & unassigned] = lbl
+    molar_mask = np.zeros_like(labeled_foreground, dtype=bool)
+    for lbl in large_labels:
+        if lbl == bone_lbl:
+            continue
+        component = labeled_foreground == lbl
+        if np.any(enamel_mask & component):
+            molar_mask |= component
 
-    # Reclaim voxels removed by the bridge cut (thin necks) by growing each
-    # label a couple voxels back into the full foreground, still respecting
-    # earlier claims so cut bridges stay split between whichever side is closer.
-    for _ in range(2):
-        for lbl in range(1, n_seeds + 1):
-            claimed = grown == lbl
-            if not claimed.any():
-                continue
-            grown_back = dilate_mask(claimed, radius=1, if_2d=False) & foreground
-            unassigned = grown == 0
-            grown[grown_back & unassigned] = lbl
-
-    return grown
+    return molar_mask
 
 
 def segment_molar_bone(
     preprocessed_volume: np.ndarray,
-    max_molars: int = 4,
     min_enamel_seed_size: int = _MIN_ENAMEL_SEED_SIZE,
+    threshold_step: float = 0.01,
+    max_iters: int = 200,
     debug: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Segment molars and bone using enamel-anchored region growing.
+    Segment molars and bone by escalating an intensity threshold until
+    enamel disconnects from bone.
 
-    After incisor removal, enamel (the brightest tissue in microCT) is only
-    present in molars. We locate enamel clusters as seeds for each molar, then
-    grow each seed into the full foreground. Foreground not reached by any seed
-    is classified as bone.
+    Dentin (the bulk of a molar) and bone sit at overlapping intensities, so
+    a single global threshold either fuses molars to bone or cuts into real
+    tissue. Enamel is strictly brighter than both, so it can always be
+    isolated cleanly. We use that asymmetry to find a working separation
+    threshold: starting from the full foreground, raise the threshold until
+    every enamel-bearing connected component is disconnected from the bone
+    component (identified as the largest component by voxel count -- bone
+    dominates by volume, so this is the simplest reliable way to identify
+    it). Every other large component that contains enamel is then a molar.
 
     This is robust to disconnected molar components because each tooth is
-    anchored independently by its own enamel signal rather than relying on
-    connected-component selection.
+    identified by its own enamel signal rather than relying on a single
+    global threshold to directly build the molar mask.
 
-    Falls back to the erosion-based max-intensity method if no enamel seeds
-    are found (e.g. very low-resolution scans where enamel is indistinct).
+    Falls back to the erosion-based max-intensity method if no enamel is
+    found at all (e.g. very low-resolution scans where enamel is
+    indistinct).
 
     Parameters:
         preprocessed_volume: Intensity volume with incisor removed.
-        max_molars: Upper bound on the number of molar seeds to find.
-        min_enamel_seed_size: Minimum voxels for an enamel cluster to be used
-            as a seed. Filters out noise speckles.
-        debug: If True, open a napari viewer showing the enamel seeds
-            relative to the foreground mask before growing.
+        min_enamel_seed_size: Minimum voxels for an enamel cluster to count,
+            filtering out noise speckles.
+        threshold_step: Amount to raise the foreground intensity threshold
+            each escalation iteration.
+        max_iters: Safety cap on escalation steps.
+        debug: If True, open a napari viewer showing enamel vs. foreground
+            before separation, then the final bone/molar split.
 
     Returns:
         (bone_mask, molar_mask) — boolean masks.
@@ -380,11 +360,16 @@ def segment_molar_bone(
         empty = np.zeros_like(foreground)
         return empty, empty
 
-    # --- Primary path: enamel-seeded region growing -----------------------
-    seeds = _enamel_seeds(
-        preprocessed_volume, foreground,
-        min_enamel_seed_size, max_molars,
-        debug=debug,
+    # --- Primary path: enamel-disconnection threshold escalation -----------
+    fg_vals = preprocessed_volume[foreground]
+    enamel_threshold = _find_enamel_threshold(fg_vals, debug=debug)
+    enamel_mask = foreground & (preprocessed_volume >= enamel_threshold)
+
+    labeled_enamel, _ = label(enamel_mask, connectivity=1, return_num=True)  # type: ignore
+    enamel_counts = np.bincount(labeled_enamel.ravel())
+    enamel_counts[0] = 0
+    enamel_mask = enamel_mask & np.isin(
+        labeled_enamel, np.flatnonzero(enamel_counts >= min_enamel_seed_size)
     )
 
     if debug:
@@ -392,27 +377,46 @@ def segment_molar_bone(
             preprocessed_volume,
             additional_volumes={
                 "Foreground": (foreground, "gray"),
-                "Enamel Seeds": (seeds, "red") if seeds is not None else (np.zeros_like(foreground), "red"),
+                "Enamel": (enamel_mask, "yellow"),
             },
-            title="[debug] Enamel Seeds vs Foreground Mask",
+            title="[debug] Enamel vs Foreground Mask",
         )
 
-    if seeds is not None:
-        logger.info("Segmenting molars via enamel-anchored region growing")
-        grown = _grow_from_seeds(seeds, foreground)
+    if enamel_mask.any():
+        logger.info("Segmenting molars via enamel-disconnection threshold escalation")
+        labeled_foreground, threshold, n_iters = _find_molar_separation_threshold(
+            preprocessed_volume, enamel_mask,
+            min_component_size=MIN_COMPONENT_SIZE,
+            threshold_step=threshold_step,
+            max_iters=max_iters,
+        )
 
-        molar_mask = grown > 0
-        bone_mask = foreground & ~molar_mask
+        molar_mask = _extract_molar_mask(
+            labeled_foreground, enamel_mask, min_component_size=MIN_COMPONENT_SIZE,
+        )
+        bone_mask = (labeled_foreground > 0) & ~molar_mask
 
         logger.info(
-            "Enamel-seeded segmentation: molar voxels=%d, bone voxels=%d",
-            int(molar_mask.sum()), int(bone_mask.sum()),
+            "Enamel-disconnection segmentation: threshold=%.4f (%d iterations), "
+            "molar voxels=%d, bone voxels=%d",
+            threshold, n_iters, int(molar_mask.sum()), int(bone_mask.sum()),
         )
+
+        if debug:
+            create_3d_visualization(
+                preprocessed_volume,
+                additional_volumes={
+                    "Bone": (bone_mask, "blue"),
+                    "Molar": (molar_mask, "red"),
+                },
+                title=f"[debug] Bone/Molar Split (threshold={threshold:.4f}, iters={n_iters})",
+            )
+
         return bone_mask, molar_mask
 
     # --- Fallback: erosion-based connected-component selection ------------
     logger.warning(
-        "Enamel seeding failed — falling back to erosion-based component selection"
+        "No enamel found — falling back to erosion-based component selection"
     )
     return _segment_molar_bone_by_erosion(preprocessed_volume, foreground)
 

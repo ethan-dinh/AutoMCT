@@ -115,7 +115,7 @@ def non_local_means_filter(
 
         return result
 
-    h_use = h if h is not None else float(0.8 * estimate_sigma(volume))  # type: ignore
+    h_use = h if h is not None else float(0.8 * estimate_sigma(volume))
     return denoise_nl_means(
         volume,
         h=h_use,
@@ -750,6 +750,7 @@ def _plot_valley_histogram(
     ax.legend(fontsize=8)
     plt.tight_layout()
     plt.show()
+    plt.close(fig)
 
 
 # ------------------------------------------------------------------

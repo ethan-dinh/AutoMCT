@@ -3,11 +3,13 @@ CLI entry point for the mandible segmentation pipeline.
 """
 
 import argparse
+import datetime
+import gc
 import logging
 import os
 import pathlib
 
-from data_io import load_bmp_stack, load_tiff, save_ct_volume_as_tiff, save_mask_as_tiff
+from data_io import load_bmp_stack, load_nrrd, load_tiff, save_ct_volume_as_tiff, save_mask_as_tiff
 from pipeline import segment_mandible
 from visualization import create_3d_visualization
 
@@ -16,8 +18,8 @@ from visualization import create_3d_visualization
 # Logging
 # ------------------------------------------------------------------
 
-def setup_logging() -> None:
-    """Configure coloured console logging."""
+def setup_logging(out_root: str) -> None:
+    """Configure coloured console logging plus a plain-text .log file under out_root."""
 
     class ColorFormatter(logging.Formatter):
         COLORS = {
@@ -30,13 +32,23 @@ def setup_logging() -> None:
         RESET = "\033[0m"
 
         def format(self, record):
+            # Colorize a copy of the record so other handlers (e.g. the file
+            # handler) sharing this same LogRecord see the plain levelname.
             color = self.COLORS.get(record.levelname, self.RESET)
+            record = logging.makeLogRecord(record.__dict__)
             record.levelname = f"{color}{record.levelname}{self.RESET}"
             return super().format(record)
 
-    handler = logging.StreamHandler()
-    handler.setFormatter(ColorFormatter("[%(levelname)s] - %(message)s"))
-    logging.basicConfig(level=logging.INFO, handlers=[handler])
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(ColorFormatter("[%(levelname)s] - %(message)s"))
+
+    os.makedirs(out_root, exist_ok=True)
+    log_path = os.path.join(out_root, f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}.log")
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] - %(message)s"))
+
+    logging.basicConfig(level=logging.INFO, handlers=[console_handler, file_handler])
+    logging.info("Logging to %s", log_path)
 
 
 # ------------------------------------------------------------------
@@ -49,7 +61,8 @@ def process_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--input_path", "-i", required=True, type=str,
-        help="Path to a .nrrd/.tif file, or a directory containing per-sample BMP stack sub-folders.",
+        help="Path to a .nrrd/.tif file, or a directory containing per-sample BMP stack "
+             "sub-folders and/or loose .nrrd/.tif/.tiff files (one per sample).",
     )
     parser.add_argument(
         "--log", "-l", action="store_true",
@@ -103,6 +116,9 @@ def _save_results(
             },
         )
 
+    del bmp_data, preprocessed, incisor, bone, molar
+    gc.collect()
+
 
 def _process_single_file(args: argparse.Namespace, out_root: str) -> None:
     """Handle a single .nrrd / .tif / .tiff input file."""
@@ -120,15 +136,17 @@ def _process_single_file(args: argparse.Namespace, out_root: str) -> None:
             display_volume = original if original is not None else incisor
             if display_volume is None:
                 logging.error("No volume available to visualize for %s", sample_name)
-                return
-            create_3d_visualization(
-                display_volume,
-                additional_volumes={
-                    "Incisor": (incisor, "orange"),
-                    "Bone":    (bone,    "grey"),
-                    "Molar":   (molar,   "cyan"),
-                },
-            )
+            else:
+                create_3d_visualization(
+                    display_volume,
+                    additional_volumes={
+                        "Incisor": (incisor, "orange"),
+                        "Bone":    (bone,    "grey"),
+                        "Molar":   (molar,   "cyan"),
+                    },
+                )
+            del original, incisor, bone, molar, display_volume
+            gc.collect()
         if input(f"Re-segment {sample_name}? (y/n): ").lower() != "y":
             return
     else:
@@ -139,60 +157,94 @@ def _process_single_file(args: argparse.Namespace, out_root: str) -> None:
     result = segment_mandible(input_path, debug=args.debug)
     if result is not None:
         _save_results(result, sample_name, out_root, args.visualize)
+    del result
+    gc.collect()
+
+
+def _load_original_for_sample(sample_path: str):
+    """Load the original volume for visualization, regardless of sample type."""
+    if sample_path.endswith(".nrrd"):
+        return load_nrrd(sample_path)
+    if sample_path.endswith((".tif", ".tiff")):
+        return load_tiff(sample_path)
+    return load_bmp_stack(sample_path)
 
 
 def _process_directory(args: argparse.Namespace, out_root: str) -> None:
-    """Handle a directory of per-sample sub-folders (BMP stacks)."""
-    input_folders = [
-        name
-        for name in os.listdir(args.input_path)
+    """
+    Handle a directory of samples, where each sample is either a per-sample
+    sub-folder (BMP stack, or itself containing a .nrrd/.tif) or a loose
+    .nrrd/.tif/.tiff file sitting directly in the input directory. Hidden
+    entries (name starting with ".") are ignored.
+
+    Samples with no existing output are segmented automatically. Samples
+    that already have output are only re-segmented if the user confirms.
+    """
+    entries = [name for name in os.listdir(args.input_path) if not name.startswith(".")]
+
+    subfolder_samples = [
+        (name, os.path.join(args.input_path, name))
+        for name in entries
         if os.path.isdir(os.path.join(args.input_path, name)) and name != "Compressed"
     ]
+    loose_file_samples = [
+        (pathlib.Path(name).stem, os.path.join(args.input_path, name))
+        for name in entries
+        if name.endswith((".nrrd", ".tif", ".tiff"))
+        and os.path.isfile(os.path.join(args.input_path, name))
+    ]
+
+    samples = subfolder_samples + loose_file_samples
 
     to_process = []
 
-    for dir_name in input_folders:
-        incisor_tif = os.path.join(out_root, dir_name, "volumes", "incisor_volume.tif")
+    for sample_name, sample_path in samples:
+        incisor_tif = os.path.join(out_root, sample_name, "volumes", "incisor_volume.tif")
 
         if os.path.exists(incisor_tif):
-            logging.info("Already segmented: %s", dir_name)
+            logging.info("Already segmented: %s", sample_name)
 
-            if input(f"Visualize existing results for {dir_name}? (y/n): ").lower() == "y":
-                original = load_bmp_stack(os.path.join(args.input_path, dir_name))
-                incisor = load_tiff(os.path.join(out_root, dir_name, "volumes", "incisor_volume.tif"))
-                bone    = load_tiff(os.path.join(out_root, dir_name, "volumes", "bone_volume.tif"))
-                molar   = load_tiff(os.path.join(out_root, dir_name, "volumes", "molar_volume.tif"))
-                create_3d_visualization(
-                    original,
-                    additional_volumes={
-                        "Incisor": (incisor, "orange"),
-                        "Bone":    (bone,    "grey"),
-                        "Molar":   (molar,   "cyan"),
-                    },
-                )
+            if input(f"Visualize existing results for {sample_name}? (y/n): ").lower() == "y":
+                original = _load_original_for_sample(sample_path)
+                incisor = load_tiff(os.path.join(out_root, sample_name, "volumes", "incisor_volume.tif"))
+                bone    = load_tiff(os.path.join(out_root, sample_name, "volumes", "bone_volume.tif"))
+                molar   = load_tiff(os.path.join(out_root, sample_name, "volumes", "molar_volume.tif"))
+                display_volume = original if original is not None else incisor
+                if display_volume is None:
+                    logging.error("No volume available to visualize for %s", sample_name)
+                else:
+                    create_3d_visualization(
+                        display_volume,
+                        additional_volumes={
+                            "Incisor": (incisor, "orange"),
+                            "Bone":    (bone,    "grey"),
+                            "Molar":   (molar,   "cyan"),
+                        },
+                    )
+                del original, incisor, bone, molar, display_volume
+                gc.collect()
 
-            if input(f"Re-segment {dir_name}? (y/n): ").lower() != "y":
+            if input(f"Re-segment {sample_name}? (y/n): ").lower() != "y":
                 continue
-        else:
-            if input(f"Segment {dir_name}? (y/n): ").lower() != "y":
-                continue
 
-        to_process.append(dir_name)
+        to_process.append((sample_name, sample_path))
 
-    for dir_name in to_process:
-        logging.info("Segmenting %s", dir_name)
-        result = segment_mandible(os.path.join(args.input_path, dir_name), debug=args.debug)
+    for sample_name, sample_path in to_process:
+        logging.info("Segmenting %s", sample_name)
+        result = segment_mandible(sample_path, debug=args.debug)
         if result is not None:
-            _save_results(result, dir_name, out_root, args.visualize)
+            _save_results(result, sample_name, out_root, args.visualize)
+        del result
+        gc.collect()
 
 
 def main() -> None:
     args = process_args()
 
-    if args.log:
-        setup_logging()
-
     out_root = str(pathlib.Path(args.out or "segmentation_results").resolve())
+
+    if args.log:
+        setup_logging(out_root)
 
     if os.path.isfile(args.input_path):
         _process_single_file(args, out_root)

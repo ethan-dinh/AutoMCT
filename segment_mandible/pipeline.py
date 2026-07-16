@@ -267,11 +267,13 @@ def segment_mandible(
     try:
         logger.info("Removing incisor from volume")
         incisor_mask_dilated = dilate_mask(incisor_mask, radius=2)
+        
         # Use the non-CLAHE preprocessed volume (masked to the same bone/molar
         # region as conservative_volume) so molar segmentation sees true
         # relative intensities — CLAHE's local contrast boost flattens the
         # global brightness gap between enamel and bone that segment_molar_bone
         # relies on to find enamel seeds.
+        
         bone_molar_region = conservative_volume > 0
         bone_molar_volume = np.where(
             incisor_mask_dilated, 0, np.where(bone_molar_region, preprocessed_volume, 0)
@@ -313,8 +315,8 @@ def _segment_bone_molar_and_finish(
         del bone_molar_volume
 
         # Dilate the molar_mask to ensure we capture the entire molar structure, which can be porous and have gaps in the initial segmentation
-        logger.info("Dilating molar mask to capture porous structure")
-        molar_mask = dilate_mask(molar_mask, radius=3)
+        """ logger.info("Dilating molar mask to capture porous structure")
+        molar_mask = dilate_mask(molar_mask, radius=3) """
 
         bone_volume = np.where(bone_mask, bmp_data, 0)
         molar_volume = np.where(molar_mask, bmp_data, 0)

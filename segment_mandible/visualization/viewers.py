@@ -55,4 +55,13 @@ def create_3d_visualization(
     except Exception as e:
         logger.error("Error creating 3D visualization: %s", e)
     finally:
+        if viewer is not None:
+            try:
+                viewer.close()
+            except RuntimeError:
+                # napari.run() already tore down the Qt widget when the user
+                # closed the window, so the underlying C++ object is gone --
+                # nothing left to close.
+                pass
+        del viewer
         gc.collect()
