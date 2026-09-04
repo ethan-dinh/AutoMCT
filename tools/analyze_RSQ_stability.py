@@ -445,11 +445,29 @@ def angular_spectrum(
     if total <= 0:
         return {"ok": False, "reason": "sinogram has no angular variation"}
 
+    low_p = float(power[1:low_cut].sum())
+    mid_p = float(power[low_cut:high_cut].sum())
+    high_p = float(power[high_cut:].sum())
+
     return {
         "ok": True,
-        "low_frac": float(power[1:low_cut].sum() / total),
-        "mid_frac": float(power[low_cut:high_cut].sum() / total),
-        "high_frac": float(power[high_cut:].sum() / total),
+        "low_frac": low_p / total,
+        "mid_frac": mid_p / total,
+        "high_frac": high_p / total,
+        # Absolute band powers are kept because the *fractions* alone cannot
+        # distinguish motion from a weak signal. Detector photon noise is
+        # flat in angular frequency and roughly constant for a fixed
+        # protocol, so it contributes about the same absolute high-frequency
+        # power to every scan; a specimen with little attenuation contrast
+        # therefore shows a large high_frac purely because its low-frequency
+        # signal is small. Observed directly here: across four scans the
+        # absolute high-band power was 5.4-5.9e1 in all of them while the
+        # low-band power ranged over 15x, so high_frac tracked contrast
+        # rather than stability.
+        "low_power": low_p,
+        "mid_power": mid_p,
+        "high_power": high_p,
+        "contrast": float(sino.std()),
         "n_angles": int(n_ang),
         "low_cut": low_cut,
         "high_cut": high_cut,
@@ -512,6 +530,7 @@ def analyze_rows(
     wildly between neighbouring rows is measuring anatomy, not stability.
     """
     highs, mids, lows, medians, spikes = [], [], [], [], []
+    hipow, contrasts = [], []
     per_row = []
 
     for row in rows:
@@ -530,11 +549,14 @@ def analyze_rows(
         highs.append(spec["high_frac"])
         mids.append(spec["mid_frac"])
         lows.append(spec["low_frac"])
+        hipow.append(spec["high_power"])
+        contrasts.append(spec["contrast"])
         medians.append(fd["median"])
         spikes.append(n_spike)
         per_row.append({
             "row": row, "high_frac": spec["high_frac"],
             "mid_frac": spec["mid_frac"], "low_frac": spec["low_frac"],
+            "high_power": spec["high_power"], "contrast": spec["contrast"],
             "frame_diff_median": fd["median"], "n_spikes": n_spike,
         })
 
@@ -550,6 +572,8 @@ def analyze_rows(
         "mid_frac_mean": float(np.mean(mids)),
         "low_frac_mean": float(np.mean(lows)),
         "frame_diff_median": float(np.median(medians)),
+        "high_power_median": float(np.median(hipow)),
+        "contrast_median": float(np.median(contrasts)),
         "n_spikes_median": int(np.median(spikes)),
         "per_row": per_row,
     }
@@ -602,10 +626,53 @@ def judge(metrics: dict, *, references: list[dict] | None, ratio_warn: float,
     fd_ratio = (stats["frame_diff_median"] / fd_baseline
                 if fd_baseline > 0 else float("nan"))
 
+    # Separate the two ways high_frac can rise. Motion adds high-frequency
+    # power; weak attenuation contrast merely shrinks the low-frequency
+    # signal that high_frac is divided by, leaving the absolute high-band
+    # power (mostly detector noise) unchanged. Comparing absolute high-band
+    # power tells them apart, and the contrast ratio says whether a low-SNR
+    # explanation is even on the table.
+    ref_hp = [r["stability"]["high_power_median"] for r in references
+              if r.get("stability", {}).get("ok")]
+    ref_ct = [r["stability"]["contrast_median"] for r in references
+              if r.get("stability", {}).get("ok")]
+    hp_baseline = float(np.median(ref_hp)) if ref_hp else float("nan")
+    ct_baseline = float(np.median(ref_ct)) if ref_ct else float("nan")
+    hp_ratio = (stats["high_power_median"] / hp_baseline
+                if hp_baseline > 0 else float("nan"))
+    ct_ratio = (stats["contrast_median"] / ct_baseline
+                if ct_baseline > 0 else float("nan"))
+
     reasons = [
         f"high-frequency angular power is {ratio:.2f}x the reference median",
         f"consecutive-projection disagreement is {fd_ratio:.2f}x the reference",
     ]
+
+    # A scan whose absolute high-band power matches the references but whose
+    # contrast is much lower is not unstable — it is under-contrasted, and
+    # its high_frac is inflated by its own weak signal. Saying "unstable"
+    # here would send the user looking for a mounting fault that is not
+    # there, so it is called out explicitly as a different problem.
+    low_contrast = (
+        np.isfinite(ct_ratio) and ct_ratio < 0.5
+        and np.isfinite(hp_ratio) and hp_ratio < 1.5
+    )
+    if low_contrast:
+        return {
+            "level": "low-contrast",
+            "reasons": [
+                f"attenuation contrast is {ct_ratio:.2f}x the reference — the "
+                f"specimen is far less radiodense or less well filled",
+                f"absolute high-frequency power is {hp_ratio:.2f}x the "
+                f"reference, i.e. the noise floor is normal",
+                f"the elevated {ratio:.2f}x power *fraction* therefore "
+                f"reflects weak signal, not sample motion; this scan is "
+                f"noise-limited rather than unstable",
+            ],
+            "high_frac_ratio": ratio, "frame_diff_ratio": fd_ratio,
+            "high_power_ratio": hp_ratio, "contrast_ratio": ct_ratio,
+            "baseline_high_frac": baseline, "n_references": len(ref_high),
+        }
 
     # With two or more references, their own disagreement is the noise floor:
     # a scan is only called out if it exceeds what good scans do to each
@@ -630,7 +697,8 @@ def judge(metrics: dict, *, references: list[dict] | None, ratio_warn: float,
         reasons.append("within the spread seen between known-good scans")
 
     return {"level": level, "reasons": reasons, "high_frac_ratio": ratio,
-            "frame_diff_ratio": fd_ratio,
+            "frame_diff_ratio": fd_ratio, "high_power_ratio": hp_ratio,
+            "contrast_ratio": ct_ratio,
             "baseline_high_frac": baseline, "n_references": len(ref_high)}
 
 
@@ -719,14 +787,17 @@ def print_report(metrics: dict) -> None:
     log.info("  high-freq power fraction: %.6f  (median across rows; "
              "spread %.6f)", s["high_frac_median"], s["high_frac_spread"])
     log.info("  frame-to-frame median:    %.5f", s["frame_diff_median"])
+    log.info("  attenuation contrast:     %.4f", s["contrast_median"])
+    log.info("  absolute high-band power: %.3e  (noise floor; similar across "
+             "scans at one protocol)", s["high_power_median"])
     if s["n_spikes_median"]:
         log.info("  [yellow]discrete jumps: %d (median across rows)[/yellow]",
                  s["n_spikes_median"])
 
     v = metrics.get("verdict", {})
     colour = {"stable": "green", "suspect": "yellow", "unstable": "red",
-              "unknown": "cyan", "reference": "blue"}.get(
-                  v.get("level", "unknown"), "cyan")
+              "unknown": "cyan", "reference": "blue",
+              "low-contrast": "magenta"}.get(v.get("level", "unknown"), "cyan")
     log.info("  [bold %s]VERDICT: %s[/bold %s]", colour,
              v.get("level", "unknown").upper(), colour)
     for reason in v.get("reasons", []):
