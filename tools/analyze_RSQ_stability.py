@@ -349,16 +349,27 @@ def prepare_sinogram(
     return atten - np.percentile(atten, 10.0, axis=1, keepdims=True)
 
 
-def _specimen_rows(stack: ProjectionStack, n_probe: int = 24) -> list[int]:
-    """Detector rows that actually see the specimen.
+def _specimen_rows(stack: ProjectionStack, n_probe: int = 12,
+                   lo_frac: float = 0.40, hi_frac: float = 0.62) -> list[int]:
+    """Interior detector rows that see the specimen.
 
     Rows above and below the sample carry only the mount and air; their
     sinograms are nearly constant in angle, so including them would dilute
-    every metric toward zero. Rows are ranked by how much angular variation
-    they contain and the strongest are kept.
+    every metric toward zero.
+
+    The band is deliberately kept to the specimen's interior rather than its
+    full extent. Rows near the specimen's ends carry far more high-frequency
+    angular content in *every* scan — the silhouette changes fastest there —
+    and that anatomy swamps the motion signal: across two scans of the same
+    animal known to be good, the end rows differed from each other by more
+    than a motion-affected scan differs from either. Measured on that pair,
+    including the ends put two good scans 3.3x apart, while the interior band
+    put them 1.16x apart and still separated the motion-affected scan at
+    2.2x. Rows are given as fractions of detector height so that scans with
+    different row counts are compared at the same place on the specimen.
     """
     candidates = np.linspace(
-        stack.n_rows * 0.1, stack.n_rows * 0.9, n_probe,
+        stack.n_rows * lo_frac, stack.n_rows * hi_frac, n_probe,
     ).astype(int)
 
     scores = []
@@ -374,6 +385,22 @@ def _specimen_rows(stack: ProjectionStack, n_probe: int = 24) -> list[int]:
         return [stack.n_rows // 2]
     keep = candidates[scores >= 0.5 * scores.max()]
     return [int(r) for r in keep]
+
+
+def _matched_rows(stacks: list[ProjectionStack], n: int = 12,
+                  lo_frac: float = 0.40, hi_frac: float = 0.62) -> dict[Path, list[int]]:
+    """Row indices sampling the same fractional heights in every scan.
+
+    Scans in a study need not share a row count (613 vs 666 here). Comparing
+    by absolute row index would then sample different parts of the specimen
+    in each, so the comparison would partly measure anatomy. Fractional
+    heights keep the comparison honest.
+    """
+    fracs = np.linspace(lo_frac, hi_frac, n)
+    return {
+        st.path: [int(f * st.n_rows) for f in fracs]
+        for st in stacks
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +559,7 @@ def analyze_rows(
 # Verdict
 # ---------------------------------------------------------------------------
 
-def judge(metrics: dict, *, reference: dict | None, ratio_warn: float,
+def judge(metrics: dict, *, references: list[dict] | None, ratio_warn: float,
           ratio_fail: float) -> dict:
     """Call a scan stable or not, relative to a reference when one is given.
 
@@ -553,43 +580,58 @@ def judge(metrics: dict, *, reference: dict | None, ratio_warn: float,
         return {"level": "unknown",
                 "reasons": [stats.get("reason", "metrics unavailable")]}
 
-    if reference is None:
+    if not references:
         return {
             "level": "unknown",
             "reasons": [
                 "no reference scan given, so there is no baseline to compare "
-                "against — pass --reference GOOD.rsq for a verdict",
+                "against — pass --reference GOOD1.rsq GOOD2.rsq for a verdict",
             ],
         }
 
-    ref_stats = reference.get("stability", {})
-    if not ref_stats.get("ok"):
-        return {"level": "unknown", "reasons": ["reference scan has no usable metrics"]}
+    ref_high = [r["stability"]["high_frac_median"] for r in references
+                if r.get("stability", {}).get("ok")]
+    ref_fd = [r["stability"]["frame_diff_median"] for r in references
+              if r.get("stability", {}).get("ok")]
+    if not ref_high or max(ref_high) <= 0:
+        return {"level": "unknown", "reasons": ["references have no usable metrics"]}
 
-    ref_high = ref_stats["high_frac_mean"]
-    if ref_high <= 0:
-        return {"level": "unknown", "reasons": ["reference scan has zero high-frequency power"]}
-
-    ratio = stats["high_frac_mean"] / ref_high
-    fd_ratio = (
-        stats["frame_diff_median"] / ref_stats["frame_diff_median"]
-        if ref_stats["frame_diff_median"] > 0 else float("nan")
-    )
+    baseline = float(np.median(ref_high))
+    ratio = stats["high_frac_median"] / baseline
+    fd_baseline = float(np.median(ref_fd))
+    fd_ratio = (stats["frame_diff_median"] / fd_baseline
+                if fd_baseline > 0 else float("nan"))
 
     reasons = [
-        f"high-frequency angular power is {ratio:.2f}x the reference scan",
+        f"high-frequency angular power is {ratio:.2f}x the reference median",
         f"consecutive-projection disagreement is {fd_ratio:.2f}x the reference",
     ]
-    if ratio >= ratio_fail:
+
+    # With two or more references, their own disagreement is the noise floor:
+    # a scan is only called out if it exceeds what good scans do to each
+    # other. This is what stops a single arbitrary threshold from flagging a
+    # perfectly good scan, which a fixed 2.0x cutoff was observed to do.
+    warn, fail = ratio_warn, ratio_fail
+    if len(ref_high) >= 2:
+        spread = max(ref_high) / max(min(ref_high), 1e-12)
+        warn = max(ratio_warn, spread)
+        fail = max(ratio_fail, spread * 1.5)
+        reasons.append(
+            f"reference scans differ from each other by {spread:.2f}x, so "
+            f"thresholds were raised to {warn:.2f}x / {fail:.2f}x"
+        )
+
+    if ratio >= fail:
         level = "unstable"
-    elif ratio >= ratio_warn:
+    elif ratio >= warn:
         level = "suspect"
     else:
         level = "stable"
-        reasons.append("within the range expected for a stable scan")
+        reasons.append("within the spread seen between known-good scans")
 
     return {"level": level, "reasons": reasons, "high_frac_ratio": ratio,
-            "frame_diff_ratio": fd_ratio}
+            "frame_diff_ratio": fd_ratio,
+            "baseline_high_frac": baseline, "n_references": len(ref_high)}
 
 
 # ---------------------------------------------------------------------------
@@ -662,7 +704,7 @@ def analyze(path: Path, args: argparse.Namespace,
 # Reporting
 # ---------------------------------------------------------------------------
 
-def print_report(metrics: dict, reference: dict | None = None) -> None:
+def print_report(metrics: dict) -> None:
     """Print one scan's headline numbers."""
     s = metrics["stability"]
     log.info("")
@@ -674,33 +716,32 @@ def print_report(metrics: dict, reference: dict | None = None) -> None:
     log.info("  detector rows analyzed:   %d", s["n_rows_used"])
     log.info("  rigid-rotation power:     %.4f  (expect ~0.99; lower means the "
              "sinogram may be misread)", s["low_frac_mean"])
-    log.info("  high-freq power fraction: %.6f  +/- %.6f",
-             s["high_frac_mean"], s["high_frac_spread"])
+    log.info("  high-freq power fraction: %.6f  (median across rows; "
+             "spread %.6f)", s["high_frac_median"], s["high_frac_spread"])
     log.info("  frame-to-frame median:    %.5f", s["frame_diff_median"])
     if s["n_spikes_median"]:
         log.info("  [yellow]discrete jumps: %d (median across rows)[/yellow]",
                  s["n_spikes_median"])
 
     v = metrics.get("verdict", {})
-    colour = {"stable": "green", "suspect": "yellow",
-              "unstable": "red", "unknown": "cyan"}[v.get("level", "unknown")]
+    colour = {"stable": "green", "suspect": "yellow", "unstable": "red",
+              "unknown": "cyan", "reference": "blue"}.get(
+                  v.get("level", "unknown"), "cyan")
     log.info("  [bold %s]VERDICT: %s[/bold %s]", colour,
              v.get("level", "unknown").upper(), colour)
     for reason in v.get("reasons", []):
         log.info("    - %s", reason)
 
 
-def print_comparison(reference: dict, others: list[dict]) -> None:
-    """Reference scan against each other scan, on the metrics that matter."""
+def print_comparison(references: list[dict], others: list[dict]) -> None:
+    """Reference scans against each scan under test."""
     log.info("")
     log.info("[bold]── Comparison ──[/bold]")
 
-    names = [Path(reference["file"]).stem[:20]] + [
-        Path(m["file"]).stem[:20] for m in others
-    ]
-    all_m = [reference] + others
+    all_m = references + others
+    names = [Path(m["file"]).stem[:20] for m in all_m]
     rows = [
-        ("high-freq power", lambda m: m["stability"].get("high_frac_mean")),
+        ("high-freq power", lambda m: m["stability"].get("high_frac_median")),
         ("mid-freq power", lambda m: m["stability"].get("mid_frac_mean")),
         ("frame-diff median", lambda m: m["stability"].get("frame_diff_median")),
     ]
@@ -717,8 +758,8 @@ def print_comparison(reference: dict, others: list[dict]) -> None:
                       for m in all_m))
 
     log.info("")
-    log.info("  Relative to %s:", names[0])
-    for m, n in zip(others, names[1:]):
+    log.info("  Relative to the reference median:")
+    for m, n in zip(others, names[len(references):]):
         v = m.get("verdict", {})
         r = v.get("high_frac_ratio")
         if isinstance(r, float) and np.isfinite(r):
@@ -814,17 +855,35 @@ def main() -> None:
     parser.add_argument("rsq_file", type=Path, nargs="+",
                         help="Scanco .rsq raw scan file(s) to check")
     parser.add_argument(
-        "--reference", type=Path, default=None,
+        "--reference", type=Path, nargs="+", default=None,
         help=(
-            "a .rsq scan known to be good, acquired with the same settings. "
-            "Metrics are ratioed against it; without one the tool reports the "
-            "numbers but declines to call a verdict, since the absolute values "
-            "depend on specimen and protocol"
+            "one or more .rsq scans known to be good, acquired with the same "
+            "settings. Metrics are ratioed against their median. Passing two "
+            "or more is strongly preferred: the spread between known-good "
+            "scans is the noise floor, and without it there is no way to know "
+            "whether a ratio is meaningful. Without any reference the tool "
+            "reports numbers but declines to call a verdict, since the "
+            "absolute values depend on specimen and protocol"
         ),
     )
     parser.add_argument(
         "--rows", type=int, nargs="+", default=None,
-        help="detector rows to analyze (default: auto-select rows seeing the specimen)",
+        help=(
+            "explicit detector rows to analyze, overriding the fractional "
+            "band. Only meaningful when every scan has the same row count"
+        ),
+    )
+    parser.add_argument(
+        "--row-lo", type=float, default=0.40,
+        help="bottom of the analyzed band, as a fraction of detector height",
+    )
+    parser.add_argument(
+        "--row-hi", type=float, default=0.62,
+        help=(
+            "top of the analyzed band. The default band is the specimen's "
+            "interior: rows near its ends carry far more high-frequency "
+            "content in every scan, which masks the motion signal"
+        ),
     )
     parser.add_argument(
         "--col-range", type=int, nargs=2, default=None, metavar=("LO", "HI"),
@@ -866,45 +925,50 @@ def main() -> None:
     setup_logging(args.verbose)
 
     paths = list(args.rsq_file)
-    for p in paths + ([args.reference] if args.reference else []):
+    for p in paths + (list(args.reference) if args.reference else []):
         if not p.is_file():
             parser.error(f"not a file: {p}")
 
-    reference = None
-    shared_rows: list[int] | None = args.rows
+    ref_paths = list(args.reference) if args.reference else []
 
-    if args.reference:
-        log.info("[bold]Reference scan[/bold]")
-        reference = analyze(args.reference, args)
-        reference["verdict"] = {"level": "stable",
-                                "reasons": ["treated as the reference baseline"]}
-        # Hold the rows fixed across every scan compared against this
-        # reference, so the ratio reflects motion and not which detector
-        # heights each scan happened to select for itself.
-        if shared_rows is None:
-            shared_rows = reference["parameters"]["rows"]
-            log.info("Holding detector rows fixed across scans for a fair "
-                     "comparison: %s", ", ".join(str(r) for r in shared_rows[:12]))
+    # Sample the same fractional detector heights in every scan. Scans in a
+    # study need not share a row count, so a fixed absolute row list would
+    # compare different parts of the specimen; fractions compare like with
+    # like. --rows still overrides this when a specific band is wanted.
+    row_map: dict[Path, list[int]] = {}
+    if args.rows is None:
+        stacks = [open_rsq(p) for p in ref_paths + paths]
+        row_map = _matched_rows(stacks, lo_frac=args.row_lo, hi_frac=args.row_hi)
+        log.info("Sampling detector heights %.0f%%-%.0f%% of the specimen in "
+                 "each scan.", 100 * args.row_lo, 100 * args.row_hi)
+
+    references = []
+    for rp in ref_paths:
+        log.info("[bold]Reference: %s[/bold]", rp.name)
+        m = analyze(rp, args, force_rows=row_map.get(rp))
+        m["verdict"] = {"level": "reference",
+                        "reasons": ["treated as a known-good baseline"]}
+        references.append(m)
 
     results = []
     for p in paths:
-        m = analyze(p, args, force_rows=shared_rows)
-        m["verdict"] = judge(m, reference=reference,
+        m = analyze(p, args, force_rows=row_map.get(p))
+        m["verdict"] = judge(m, references=references,
                              ratio_warn=args.ratio_warn, ratio_fail=args.ratio_fail)
         results.append(m)
 
-    if reference:
-        print_report(reference)
+    for m in references:
+        print_report(m)
     for m in results:
-        print_report(m, reference)
-    if reference:
-        print_comparison(reference, results)
+        print_report(m)
+    if references:
+        print_comparison(references, results)
 
     out_dir = args.output_dir or paths[0].parent
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = paths[0].stem
 
-    payload = ([reference] if reference else []) + results
+    payload = references + results
     json_path = out_dir / f"{stem}_stability.json"
     json_path.write_text(json.dumps(
         payload[0] if len(payload) == 1 else payload, indent=2,
@@ -913,7 +977,7 @@ def main() -> None:
     log.info("Wrote %s", json_path)
 
     if args.dump_sinogram:
-        for p in ([args.reference] if args.reference else []) + paths:
+        for p in ref_paths + paths:
             dump_sinogram(open_rsq(p), out_dir / f"{p.stem}_sinogram.png")
 
     if not args.no_plot:
