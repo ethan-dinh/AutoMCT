@@ -484,15 +484,28 @@ def angular_spectrum(
         "mid_frac": mid_p / total,
         "high_frac": high_p / total,
         # Absolute band powers are kept because the *fractions* alone cannot
-        # distinguish motion from a weak signal. Detector photon noise is
-        # flat in angular frequency and roughly constant for a fixed
-        # protocol, so it contributes about the same absolute high-frequency
-        # power to every scan; a specimen with little attenuation contrast
-        # therefore shows a large high_frac purely because its low-frequency
-        # signal is small. Observed directly here: across four scans the
-        # absolute high-band power was 5.4-5.9e1 in all of them while the
-        # low-band power ranged over 15x, so high_frac tracked contrast
-        # rather than stability.
+        # distinguish motion from a weak signal: a specimen with little
+        # attenuation contrast shows a large high_frac purely because the
+        # low-frequency signal it is divided by is small.
+        #
+        # That the high band is dominated by a detector noise floor is
+        # measured, not assumed. Three checks on these scans:
+        #   - It decorrelates between detector rows within ~24 um (r=0.76 at
+        #     1 row, 0.09 at 4, ~0 at 8) while the low band stays above 0.9
+        #     out to 16 rows. Anatomy is coherent over hundreds of microns;
+        #     this is not anatomy. The residual correlation at 1 row is the
+        #     detector PSF spreading an event over neighbouring rows.
+        #   - In detector columns where no specimen projects (holder only)
+        #     the high-band power is 4.6-5.3e1 in every scan regardless of
+        #     what the tube contains, i.e. a floor independent of specimen.
+        #   - It is NOT Poisson in the raw counts: variance/mean falls from
+        #     1.00 to 0.42 across the intensity range, so it is a
+        #     gain-corrected detector noise, roughly constant in absolute
+        #     terms rather than scaling with photon count.
+        # The useful quantity is therefore how far a scan's specimen region
+        # rises above its own empty-region floor: 1.5-1.6x for the good
+        # scans, 1.4x for the motion-affected one, 1.1-1.2x for the two
+        # low-contrast scans that sit almost at the floor.
         "low_power": low_p,
         "mid_power": mid_p,
         "high_power": high_p,
