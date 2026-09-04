@@ -343,10 +343,39 @@ def prepare_sinogram(
         lo, hi = col_range
         sino = sino[:, max(0, lo):min(stack.n_cols, hi)]
 
+    # Note on framing: on this scanner the field of view covers the whole
+    # specimen holder, so the detector is absorbing edge to edge at every
+    # angle and the specimen never leaves the field. A threshold on raw
+    # attenuation therefore detects the holder wall, not the specimen — it is
+    # not evidence of truncation. Anything that needs the specimen alone must
+    # subtract the static (angle-median) component first; see
+    # ``specimen_signal``.
+
     i0 = np.percentile(sino, 99.5, axis=1, keepdims=True)
     i0 = np.where(i0 <= 0, 1.0, i0)
     atten = -np.log(np.clip(sino / i0, 1e-4, None))
     return atten - np.percentile(atten, 10.0, axis=1, keepdims=True)
+
+
+def specimen_signal(sino: np.ndarray) -> dict:
+    """Split a sinogram into the rotating specimen and the static holder.
+
+    The holder is a cylinder concentric with the rotation axis, so it
+    projects to the same profile at every angle; the specimen is off-axis and
+    sweeps. Taking the median across angle isolates the holder, and what
+    remains is the specimen. This matters because the holder can account for
+    most of the attenuation in a frame — measuring "contrast" on the raw
+    sinogram largely measures the tube, not the sample.
+    """
+    static = np.median(sino, axis=0)
+    dynamic = sino - static
+    holder = float(np.abs(static).mean())
+    specimen = float(np.abs(dynamic).mean())
+    return {
+        "specimen_atten": specimen,
+        "holder_atten": holder,
+        "specimen_holder_ratio": specimen / holder if holder > 0 else float("nan"),
+    }
 
 
 def _specimen_rows(stack: ProjectionStack, n_probe: int = 12,
@@ -531,12 +560,14 @@ def analyze_rows(
     """
     highs, mids, lows, medians, spikes = [], [], [], [], []
     hipow, contrasts = [], []
+    specatt, sighold = [], []
     per_row = []
 
     for row in rows:
         sino = prepare_sinogram(stack, row, col_range=col_range)
         spec = angular_spectrum(sino, low_cut=low_cut, high_cut=high_cut)
         fd = frame_difference(sino)
+        sig = specimen_signal(sino)
         if not spec.get("ok") or not fd.get("ok"):
             continue
 
@@ -551,12 +582,16 @@ def analyze_rows(
         lows.append(spec["low_frac"])
         hipow.append(spec["high_power"])
         contrasts.append(spec["contrast"])
+        specatt.append(sig["specimen_atten"])
+        sighold.append(sig["specimen_holder_ratio"])
         medians.append(fd["median"])
         spikes.append(n_spike)
         per_row.append({
             "row": row, "high_frac": spec["high_frac"],
             "mid_frac": spec["mid_frac"], "low_frac": spec["low_frac"],
             "high_power": spec["high_power"], "contrast": spec["contrast"],
+            "specimen_atten": sig["specimen_atten"],
+            "holder_atten": sig["holder_atten"],
             "frame_diff_median": fd["median"], "n_spikes": n_spike,
         })
 
@@ -574,6 +609,8 @@ def analyze_rows(
         "frame_diff_median": float(np.median(medians)),
         "high_power_median": float(np.median(hipow)),
         "contrast_median": float(np.median(contrasts)),
+        "specimen_atten_median": float(np.median(specatt)),
+        "specimen_holder_ratio": float(np.median(sighold)),
         "n_spikes_median": int(np.median(spikes)),
         "per_row": per_row,
     }
@@ -788,6 +825,9 @@ def print_report(metrics: dict) -> None:
              "spread %.6f)", s["high_frac_median"], s["high_frac_spread"])
     log.info("  frame-to-frame median:    %.5f", s["frame_diff_median"])
     log.info("  attenuation contrast:     %.4f", s["contrast_median"])
+    log.info("  specimen signal:          %.4f  (holder removed; "
+             "specimen/holder %.3f)", s["specimen_atten_median"],
+             s["specimen_holder_ratio"])
     log.info("  absolute high-band power: %.3e  (noise floor; similar across "
              "scans at one protocol)", s["high_power_median"])
     if s["n_spikes_median"]:
