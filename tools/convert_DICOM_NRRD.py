@@ -4,17 +4,42 @@ Convert a UCSF microCT DICOM series to a filtered .nrrd volume.
 Usage:
     python convert_DICOM_NRRD.py <dicom_dir> [options]
 
+This tool is the DICOM front end for the shared conversion pipeline in
+``volume_pipeline.py``; ``convert_ISQ_NRRD.py`` is the Scanco ISQ front end.
+Everything after the volume is in memory — cropping, binning, long-axis
+reorientation, the filter chain, CLAHE, NRRD geometry and metadata — is that
+shared module, so the two tools accept the same options and produce identical
+output for identical option values.
+
 Filters applied in order:
+    0. Noise-floor threshold    — flatten the air band to a constant, so no
+                                   later stage spends itself on background
+                                   noise (optional, --noise-floor)
     1. Gaussian pre-smoothing   — suppress isolated hot pixels before NLM
     2. Non-local means (NLM)    — edge-preserving noise reduction
     3. Median filter            — remove remaining salt-and-pepper noise
+                                   (true 3-D, numba-JIT + multi-threaded — see Notes)
+    4. Anisotropic diffusion    — edge-preserving smoothing: flattens noise
+                                   within tissues but not across boundaries
+                                   (optional, --aniso-iterations)
+    5. Richardson-Lucy deconv   — recover detail lost to the imaging PSF
+                                   (optional, --rl-iterations)
+    6. TV (Chambolle) denoise   — piecewise-constant smoothing for cleaner
+                                   thresholding boundaries (optional, --tv-weight)
+    7. Unsharp mask             — high-pass boost that steepens boundary
+                                   ramps (optional, --unsharp-amount)
 
 Raw stored pixel values are preserved — no rescaling or normalization is
-applied, so window/level can be adjusted freely in downstream tools.
+applied, so window/level can be adjusted freely in downstream tools. Pass
+--apply-rescale to convert to physical units with the series' own
+RescaleSlope/Intercept, matching what convert_ISQ_NRRD.py's --apply-scaling
+does with the ISQ header's mu_scaling. (--apply-scaling is accepted here as
+an alias, matching the ISQ converter's flag name.)
 
 Output:
-    <stem>.nrrd          — filtered volume with voxel spacing embedded
-    <stem>_raw.nrrd      — unfiltered volume (optional, --save-raw)
+    <stem>_prefiltered.nrrd — cropped/binned/reoriented but unfiltered
+                              (optional, --save-raw)
+    <stem>.nrrd          — the same volume, filtered, with geometry embedded
     <stem>_enhanced.nrrd — CLAHE-boosted viewing copy (optional, --enhance-contrast)
     <stem>_meta.json     — DICOM metadata from the first slice
 
@@ -23,15 +48,86 @@ Notes:
       header so downstream tools (3D Slicer, ITK-SNAP) load it correctly.
     - NLM is run patch-by-patch in 2-D slice mode to keep RAM manageable on
       large volumes; use --nlm-3d for true 3-D NLM at higher memory cost.
+      Pass --nlm-h 0 to skip NLM entirely and get a plain conversion.
+    - The median filter is a custom numba @njit(parallel=True) 3-D sliding
+      window (reflect boundary, same semantics as scipy.ndimage.median_filter)
+      that scales across all CPU cores — several times faster than scipy's
+      single-threaded implementation, with identical output.
     - All filter parameters are tunable via CLI flags.
+    - Pass --crop to interactively select a 3-D bounding box (napari) right
+      after DICOM assembly, before any filtering runs. This speeds up every
+      later step (Gaussian, NLM, median, CLAHE all run on fewer voxels) and
+      both output volumes (prefiltered and filtered) reflect the crop.
+      The NRRD "space origin" is shifted by the crop offset, so a cropped
+      volume still lands in the same physical position as the full scan when
+      both are loaded into Slicer/ITK-SNAP.
+    - Pass --target-voxel-um to bin the volume up to a coarser voxel size
+      (e.g. --target-voxel-um 20). Per-axis integer bin factors are derived
+      from the DICOM's native spacing; because binning combines whole
+      voxels, the closest achievable size is used and reported. Applied
+      right after the crop, so the filters run on the reduced volume and
+      every output file shrinks by the same factor. Voxel spacing in the
+      NRRD header is scaled to match, so geometry stays correct at the
+      coarser resolution. Block averaging also raises SNR by sqrt(N).
+    - Pass --reorient to rotate the volume onto the tooth's own long axis. The
+      specimen is Otsu-segmented, its minimum-volume oriented bounding box is
+      fitted, and the volume is resampled so that Z runs tip -> base along the
+      long axis, Y along the second-longest box axis and X along the shortest.
+      This fixes scans whose Z happens to cut buccal-lingual, which makes every
+      slice-wise step downstream (montages, per-slice enamel area, CMPR) cut the
+      tooth the wrong way. Runs after the crop and binning, so all outputs share
+      the new orientation. When the long axis is already within
+      --reorient-snap-deg of an array axis the rotation is done as a
+      transpose/flip, so no interpolation blur is introduced at all. Voxel
+      values keep their physical positions: "space directions"/"space origin"
+      describe the rotated frame, so the result still overlays the original scan
+      in Slicer/ITK-SNAP. Add --reorient-tight to also crop to the bounding box
+      (plus --reorient-margin-mm), and --reorient-tip-at end to put the incisal
+      tip at the last slice instead of the first.
+
+If saving is slow:
+    - NRRD writing defaults here to gzip level 1 (--compression-level).
+      pynrrd's own default is level 9, which is single-threaded and 10-20x
+      slower to write for only a few percent size gain on noisy microCT
+      data. Use --compression-level 0 for uncompressed raw (fastest write,
+      largest file), or 9 if archival size matters more than time.
+    - --save-dtype int16 halves file size versus float32 (values are
+      rounded; out-of-range values are clipped with a warning). As in the
+      ISQ converter, this is lossless for an unfiltered, unbinned read of a
+      16-bit-stored series without --apply-rescale, since the volume is
+      assembled and kept at its native integer width in that case.
+    - --target-voxel-um cuts both write time and file size by the product
+      of the resulting bin factors (2x per axis = 8x smaller).
 
 If the output looks too blurry:
-    - Lower --nlm-h (try 0.5–0.7 instead of the default 1.0) — this is the
+    - Lower --nlm-h (try 0.5-0.7 instead of the default 1.0) — this is the
       strongest smoothing knob.
     - Set --gauss-sigma 0 to skip the pre-NLM Gaussian smoothing entirely.
     - Set --median-radius 0 to skip the median filter.
     - These can be combined, e.g.:
         python convert_DICOM_NRRD.py <dicom_dir> --gauss-sigma 0 --nlm-h 0.6 --median-radius 0
+
+If the borders between tissues look soft or smeared:
+    - The Gaussian, NLM and median stages are all isotropic — they blur an
+      enamel/dentin boundary as hard as they blur noise. Reach for the
+      edge-aware stages instead:
+        --aniso-iterations 10 --aniso-kappa <edge step>   (needs tuning, below)
+        --tv-weight 0.1
+    - --aniso-kappa is in the volume's own intensity units, so read the actual
+      enamel-to-dentin step off a line profile in Slicer and set kappa near
+      it. Too low and real boundaries get smoothed; too high and it behaves
+      like plain Gaussian blur.
+    - Add --unsharp-amount 1.0 last to steepen what remains. Watch for haloes
+      at the enamel surface — a bright rim just outside the true border is the
+      sign it is set too high, and a gradient-based segmenter will latch onto
+      that rim as a false edge.
+    - --rl-iterations 10 sharpens by undoing the imaging PSF rather than by
+      boosting high frequencies, so it is the more physically grounded option
+      of the two, but it is slower and amplifies residual noise each iteration.
+    - Boundary sharpness also depends on not throwing resolution away earlier:
+      --target-voxel-um bins whole voxels together, so a boundary that fell
+      inside one bin is permanently softened. Use --bin-method max to keep thin
+      enamel from being diluted if you must bin.
 
 To make enamel more visible without altering the analysis-ready <stem>.nrrd:
     - Pass --enhance-contrast to additionally write <stem>_enhanced.nrrd with
@@ -44,7 +140,6 @@ To make enamel more visible without altering the analysis-ready <stem>.nrrd:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import multiprocessing
 import sys
@@ -52,13 +147,20 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
-import nrrd
 import pydicom
 from pydicom.multival import MultiValue as DicomMultiValue
-from rich.logging import RichHandler
-from scipy.ndimage import median_filter, gaussian_filter
-from skimage.restoration import denoise_nl_means, estimate_sigma
 from tqdm import tqdm
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from volume_pipeline import (  # noqa: E402  (needs the path insert above)
+    PipelineOptions,
+    add_pipeline_arguments,
+    convert_volume,
+    directions_from_spacing,
+    options_from_args,
+    report_outputs,
+    setup_logging,
+)
 
 log = logging.getLogger(__name__)
 
@@ -90,9 +192,14 @@ def _sort_key(ds: pydicom.Dataset) -> float:
         return 0.0
 
 
-def _decode_slice(args: tuple[int, str, bool]) -> tuple[int, np.ndarray]:
-    """Picklable worker for ProcessPoolExecutor."""
-    idx, path_str, apply_rescale = args
+def _decode_slice(args: tuple[int, str, bool, str]) -> tuple[int, np.ndarray]:
+    """Picklable worker for ProcessPoolExecutor.
+
+    *dtype_name* is the dtype the caller pre-allocated the whole volume with;
+    each slice is converted to it here so the assembling process never holds a
+    second, wider copy.
+    """
+    idx, path_str, apply_rescale, dtype_name = args
     ds = pydicom.dcmread(path_str)
     if apply_rescale:
         arr = ds.pixel_array.astype(np.float32)
@@ -100,8 +207,8 @@ def _decode_slice(args: tuple[int, str, bool]) -> tuple[int, np.ndarray]:
         intercept = float(getattr(ds, "RescaleIntercept", 0.0))
         arr = arr * slope + intercept
     else:
-        arr = ds.pixel_array.astype(np.float32)
-    return idx, arr
+        arr = ds.pixel_array
+    return idx, arr.astype(np.dtype(dtype_name), copy=False)
 
 
 _SKIP_TAGS = {"PixelData", "FloatPixelData", "DoubleFloatPixelData"}
@@ -129,21 +236,23 @@ def _extract_metadata(ds: pydicom.Dataset) -> dict:
 
 
 def _read_spacing(headers: list[pydicom.Dataset]) -> tuple[float, float, float]:
-    """Return (dz, dy, dx) in mm.  Falls back to 1.0 on missing tags."""
+    """Return (dz, dy, dx) in mm.  Falls back to 1.0 on missing tags.
+
+    Used only as the fallback for ``_read_direction_matrix``, which does not
+    assume slices are stacked purely along a fixed axis (see that function).
+    """
     ds = headers[0]
     try:
         dy, dx = (float(v) for v in ds.PixelSpacing)
     except Exception:
         dx = dy = 1.0
 
-    # SliceThickness is the nominal value; prefer computed spacing from
-    # ImagePositionPatient when available (more accurate for microCT).
     dz: float = 1.0
     try:
         if len(headers) >= 2:
-            z0 = float(headers[0].ImagePositionPatient[2])
-            z1 = float(headers[1].ImagePositionPatient[2])
-            dz = abs(z1 - z0)
+            p0 = np.asarray(headers[0].ImagePositionPatient, dtype=float)
+            p1 = np.asarray(headers[1].ImagePositionPatient, dtype=float)
+            dz = float(np.linalg.norm(p1 - p0))
         else:
             dz = float(ds.SliceThickness)
     except Exception:
@@ -155,188 +264,81 @@ def _read_spacing(headers: list[pydicom.Dataset]) -> tuple[float, float, float]:
     return dz, dy, dx
 
 
-# ---------------------------------------------------------------------------
-# Filters
-# ---------------------------------------------------------------------------
-
-def _gaussian_presmoother(volume: np.ndarray, sigma: float) -> np.ndarray:
-    """Light isotropic Gaussian to suppress isolated hot pixels before NLM."""
-    if sigma <= 0:
-        return volume
-    log.info("Gaussian pre-smoothing (σ=%.2f)…", sigma)
-    return gaussian_filter(volume.astype(np.float32), sigma=sigma)
-
-
-def _nlm_worker(args: tuple[int, np.ndarray, int, int, float]) -> tuple[int, np.ndarray]:
-    """Picklable per-slice NLM worker for ProcessPoolExecutor."""
-    idx, slc, patch_size, patch_distance, h = args
-    result = denoise_nl_means(
-        slc,
-        patch_size=patch_size,
-        patch_distance=patch_distance,
-        h=h,
-        fast_mode=True,
-        preserve_range=True,
-    )
-    return idx, result.astype(np.float32)
-
-
-def _nlm_filter(
-    volume: np.ndarray,
-    patch_size: int,
-    patch_distance: int,
-    h_factor: float,
-    mode_3d: bool,
-    workers: int | None = None,
-) -> np.ndarray:
-    """Non-local means denoising.
-
-    2-D slice mode (default): slices are denoised in parallel across workers.
-    3-D mode (--nlm-3d): denoises the whole volume jointly on a single process
-    — better results on isotropic acquisitions but uses significantly more RAM.
+def _read_direction_matrix(headers: list[pydicom.Dataset]) -> np.ndarray:
     """
-    volume = volume.astype(np.float32)
+    Build the 3x3 NRRD "space directions" matrix (LPS) from actual DICOM
+    orientation tags, instead of assuming a fixed axial acquisition.
 
-    if mode_3d:
-        log.info("NLM filter — 3-D mode (patch=%d, search=%d, h×σ=%.1f)…",
-                 patch_size, patch_distance, h_factor)
-        sigma_est = float(np.mean(estimate_sigma(volume)))
-        log.debug("  Estimated noise σ = %.4f", sigma_est)
-        return denoise_nl_means(
-            volume,
-            patch_size=patch_size,
-            patch_distance=patch_distance,
-            h=h_factor * sigma_est,
-            fast_mode=True,
-            preserve_range=True,
-        ).astype(np.float32)
+    Row i of the returned matrix is the (L, P, S) direction vector for array
+    axis i, scaled by that axis's physical spacing — i.e. exactly what
+    ``nrrd.write`` expects for "space directions" when array axis order is
+    (Z, Y, X).
 
-    log.info("NLM filter — 2-D parallel mode (patch=%d, search=%d, h×σ=%.1f)…",
-             patch_size, patch_distance, h_factor)
-    # Estimate noise from a representative subset of slices for speed
-    sample_idx = np.linspace(0, volume.shape[0] - 1, min(10, volume.shape[0]), dtype=int)
-    sigma_est = float(np.mean([
-        np.mean(estimate_sigma(volume[i])) for i in sample_idx
-    ]))
-    log.debug("  Estimated noise σ = %.4f (from %d sample slices)", sigma_est, len(sample_idx))
-    h = h_factor * sigma_est
+    - Axis 2 (X / columns) and axis 1 (Y / rows) come from
+      ``ImageOrientationPatient``'s row/column direction cosines, scaled by
+      ``PixelSpacing`` (row spacing, column spacing).
+    - Axis 0 (Z / slices) comes from the actual displacement between
+      consecutive slices' ``ImagePositionPatient`` — this is the true slice
+      direction and is correct even for gantry-tilted or non-axial series,
+      unlike assuming a pure +S step.
 
-    out = np.empty_like(volume)
-    nlm_args = [(i, volume[i], patch_size, patch_distance, h) for i in range(volume.shape[0])]
-    mp_ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx) as pool:
-        futures = [pool.submit(_nlm_worker, a) for a in nlm_args]
-        with tqdm(total=volume.shape[0], desc="NLM", unit="slice") as pbar:
-            for fut in as_completed(futures):
-                idx, slc = fut.result()
-                out[idx] = slc
-                pbar.update()
-    return out
-
-
-def _median_filter(volume: np.ndarray, radius: int) -> np.ndarray:
-    """3-D median filter to remove residual salt-and-pepper noise."""
-    size = 2 * radius + 1
-    log.info("Median filter (size=%d)…", size)
-    return median_filter(volume, size=size).astype(np.float32)
-
-
-def _clahe_enhance(volume: np.ndarray, clip_limit: float, kernel_size: int | None) -> np.ndarray:
-    """Slice-wise CLAHE for a viewing copy with enamel made visually distinct.
-
-    Unlike percentile contrast stretching, CLAHE boosts *local* contrast so the
-    enamel/dentin/bone boundary becomes visible without crushing the rest of
-    the dynamic range. Applied per-slice (axial) since skimage's CLAHE expects
-    2-D images and per-slice equalization keeps RAM low. Output is rescaled
-    back to the input's original intensity range so it stays comparable to
-    the raw volume, just with enhanced local contrast.
+    Falls back to identity axial (L, P, S) directions if orientation tags
+    are missing, with a warning. That fallback is the same geometry the ISQ
+    reader always uses, so an unoriented DICOM series and an ISQ scan of the
+    same specimen land in the same frame.
     """
-    from skimage.exposure import equalize_adapthist
+    ds = headers[0]
+    try:
+        iop = np.asarray(ds.ImageOrientationPatient, dtype=float)
+        row_cosine = iop[0:3]   # direction of increasing column index (dx)
+        col_cosine = iop[3:6]   # direction of increasing row index (dy)
+        dy, dx = (float(v) for v in ds.PixelSpacing)
 
-    log.info("CLAHE contrast enhancement (clip_limit=%.3f)…", clip_limit)
-    vmin, vmax = float(volume.min()), float(volume.max())
-    if vmax == vmin:
-        return volume.astype(np.float32)
+        x_vec = row_cosine * dx   # array axis 2 (X)
+        y_vec = col_cosine * dy   # array axis 1 (Y)
 
-    # equalize_adapthist expects input scaled to [0, 1] float
-    normed = (volume - vmin) / (vmax - vmin)
-    out = np.empty_like(normed)
-    for i in tqdm(range(normed.shape[0]), desc="CLAHE", unit="slice"):
-        out[i] = equalize_adapthist(
-            normed[i],
-            kernel_size=kernel_size,
-            clip_limit=clip_limit,
+        if len(headers) >= 2:
+            p0 = np.asarray(headers[0].ImagePositionPatient, dtype=float)
+            p1 = np.asarray(headers[1].ImagePositionPatient, dtype=float)
+            z_vec = p1 - p0   # array axis 0 (Z) — true inter-slice step
+        else:
+            slice_cosine = np.cross(row_cosine, col_cosine)
+            z_vec = slice_cosine * float(getattr(ds, "SliceThickness", 1.0))
+
+        return np.array([z_vec, y_vec, x_vec], dtype=float)
+
+    except Exception:
+        log.warning(
+            "Missing/invalid ImageOrientationPatient — assuming axial "
+            "acquisition (rows=L, columns=P, slices=S). Non-axial or "
+            "oblique scans will have incorrect NRRD orientation."
         )
-    # Rescale back to original intensity range so the file stays compatible
-    # with the same window/level habits used on the raw volume.
-    return (out * (vmax - vmin) + vmin).astype(np.float32)
+        return directions_from_spacing(*_read_spacing(headers))
 
 
-# ---------------------------------------------------------------------------
-# NRRD writer
-# ---------------------------------------------------------------------------
-
-def _write_nrrd(path: Path, volume: np.ndarray, spacing_zyx: tuple[float, float, float]) -> None:
-    """Write *volume* to NRRD with physical voxel spacing encoded in the header.
-
-    NRRD convention: space directions encodes the column-step vectors
-    (right-hand, LPS or RAS).  We write a diagonal matrix — pure scaling,
-    no shear or rotation — so tools that read NRRD spacing work correctly.
-    """
-    dz, dy, dx = spacing_zyx
-    header = {
-        "space": "left-posterior-superior",
-        "space directions": [
-            [dz, 0.0, 0.0],
-            [0.0, dy, 0.0],
-            [0.0, 0.0, dx],
-        ],
-        "space origin": [0.0, 0.0, 0.0],
-        "kinds": ["domain", "domain", "domain"],
-    }
-    log.info("Writing NRRD → %s", path)
-    nrrd.write(str(path), volume, header)
-
-
-# ---------------------------------------------------------------------------
-# Pipeline
-# ---------------------------------------------------------------------------
-
-def convert(
+def read_dicom_series(
     dicom_dir: Path,
-    output_dir: Path,
     *,
-    workers: int | None = None,
     apply_rescale: bool = False,
-    save_raw: bool = False,
-    # Gaussian pre-smoother
-    gauss_sigma: float = 0.5,
-    # NLM
-    nlm_patch: int = 5,
-    nlm_search: int = 11,
-    nlm_h: float = 1.0,
-    nlm_3d: bool = False,
-    # Median
-    median_radius: int = 1,
-    # CLAHE contrast enhancement (viewing copy only)
-    enhance_contrast: bool = False,
-    clahe_clip_limit: float = 0.01,
-    clahe_kernel_size: int | None = None,
-) -> dict[str, Path]:
-    dicom_dir = dicom_dir.resolve()
-    output_dir = output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = dicom_dir.name
-    outputs: dict[str, Path] = {}
+    workers: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Assemble a sorted DICOM series into the pipeline's source tuple.
 
-    # 1. Discover DICOM files
+    Returns ``(volume [Z, Y, X], direction_matrix, origin, meta)``.
+
+    As in the ISQ reader, the series' own stored dtype is kept when
+    ``apply_rescale`` is off: every downstream stage promotes to float32 on
+    demand, so an integer-stored series is assembled at its native width and
+    peak memory is halved on a full-resolution scan without changing a single
+    output value. With ``apply_rescale`` on, slope/intercept produce
+    non-integer values, so the volume is float32.
+    """
     log.info("Scanning %s for DICOM files…", dicom_dir)
     files = _collect_dicom_files(dicom_dir)
     if not files:
         raise ValueError(f"No DICOM files found in {dicom_dir}")
     log.info("Found %d slices.", len(files))
 
-    # 2. Read and sort headers
     log.info("Reading and sorting headers…")
     headers: list[pydicom.Dataset] = []
     path_map: dict[int, Path] = {}
@@ -347,17 +349,36 @@ def convert(
     headers.sort(key=_sort_key)
     sorted_paths = [path_map[id(ds)] for ds in headers]
 
-    spacing_zyx = _read_spacing(headers)
-    log.info("Voxel spacing (Z×Y×X): %.4f × %.4f × %.4f mm", *spacing_zyx)
+    direction_matrix = _read_direction_matrix(headers)
+    # Physical (LPS) position of voxel [0, 0, 0] — the first slice's
+    # ImagePositionPatient. Carried through any crop so cropped outputs stay
+    # registered to the original scan.
+    try:
+        origin = np.asarray(headers[0].ImagePositionPatient, dtype=float)
+    except Exception:
+        log.warning("Missing ImagePositionPatient — using origin [0, 0, 0].")
+        origin = np.zeros(3)
 
-    # 3. Decode pixels in parallel
     first_ds = pydicom.dcmread(str(sorted_paths[0]))
-    rows, cols = first_ds.pixel_array.shape
+    first_arr = first_ds.pixel_array
+    rows, cols = first_arr.shape
     n_slices = len(sorted_paths)
-    log.info("Assembling volume (%d × %d × %d)…", n_slices, rows, cols)
 
-    volume = np.empty((n_slices, rows, cols), dtype=np.float32)
-    decode_args = [(i, str(p), apply_rescale) for i, p in enumerate(sorted_paths)]
+    # Rescaling makes values non-integer, so that path is float32. Otherwise
+    # keep the stored integer width (see the docstring); a float stored type
+    # is already float32-or-wider and needs no widening either.
+    if apply_rescale or not np.issubdtype(first_arr.dtype, np.integer):
+        volume_dtype = np.dtype(np.float32)
+    else:
+        volume_dtype = first_arr.dtype
+    log.info(
+        "Assembling volume (%d × %d × %d, %s)…", n_slices, rows, cols, volume_dtype,
+    )
+
+    volume = np.empty((n_slices, rows, cols), dtype=volume_dtype)
+    decode_args = [
+        (i, str(p), apply_rescale, volume_dtype.name) for i, p in enumerate(sorted_paths)
+    ]
     mp_ctx = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx) as pool:
         futures = [pool.submit(_decode_slice, a) for a in decode_args]
@@ -367,51 +388,30 @@ def convert(
                 volume[idx] = arr
                 pbar.update()
 
-    # 4. Optionally save raw volume
-    if save_raw:
-        raw_path = output_dir / f"{stem}_raw.nrrd"
-        _write_nrrd(raw_path, volume, spacing_zyx)
-        outputs["raw"] = raw_path
+    return volume, direction_matrix, origin, _extract_metadata(headers[0])
 
-    # 5. Apply filter pipeline
-    volume = _gaussian_presmoother(volume, gauss_sigma)
-    volume = _nlm_filter(volume, nlm_patch, nlm_search, nlm_h, nlm_3d, workers)
-    volume = _median_filter(volume, median_radius)
 
-    # 6. Write filtered NRRD
-    nrrd_path = output_dir / f"{stem}.nrrd"
-    _write_nrrd(nrrd_path, volume, spacing_zyx)
-    outputs["filtered"] = nrrd_path
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
 
-    # 6b. Optional CLAHE-enhanced viewing copy (enamel visibility), separate file
-    if enhance_contrast:
-        enhanced = _clahe_enhance(volume, clahe_clip_limit, clahe_kernel_size)
-        enhanced_path = output_dir / f"{stem}_enhanced.nrrd"
-        _write_nrrd(enhanced_path, enhanced, spacing_zyx)
-        outputs["enhanced"] = enhanced_path
-        del enhanced
+def convert(
+    dicom_dir: Path,
+    output_dir: Path,
+    opts: PipelineOptions | None = None,
+) -> dict[str, Path]:
+    """Convert *dicom_dir* into *output_dir* using the shared pipeline."""
+    opts = opts or PipelineOptions()
+    dicom_dir = dicom_dir.resolve()
 
-    # 7. Save metadata
-    meta_path = output_dir / f"{stem}_meta.json"
-    meta = _extract_metadata(headers[0])
-    meta["_spacing_mm"] = {"z": spacing_zyx[0], "y": spacing_zyx[1], "x": spacing_zyx[2]}
-    meta["_filter_params"] = {
-        "gauss_sigma": gauss_sigma,
-        "nlm_patch": nlm_patch,
-        "nlm_search": nlm_search,
-        "nlm_h_factor": nlm_h,
-        "nlm_3d": nlm_3d,
-        "median_radius": median_radius,
-        "enhance_contrast": enhance_contrast,
-        "clahe_clip_limit": clahe_clip_limit if enhance_contrast else None,
-        "clahe_kernel_size": clahe_kernel_size if enhance_contrast else None,
-    }
-    with open(meta_path, "w") as fh:
-        json.dump(meta, fh, indent=2, default=str)
-    log.info("Metadata → %s", meta_path)
-    outputs["meta"] = meta_path
-
-    return outputs
+    return convert_volume(
+        output_dir=output_dir,
+        stem=dicom_dir.name,
+        read_source=lambda: read_dicom_series(
+            dicom_dir, apply_rescale=opts.apply_rescale, workers=opts.workers,
+        ),
+        opts=opts,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -426,59 +426,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("dicom_dir", type=Path, help="Directory containing DICOM files")
     p.add_argument("--out", type=Path, default=None,
                    help="Output directory (default: same parent as dicom_dir)")
-    p.add_argument("--workers", type=int, default=None,
-                   help="Worker processes for parallel slice decoding")
-    p.add_argument("--apply-rescale", action="store_true",
-                   help="Apply DICOM RescaleSlope/Intercept before filtering")
-    p.add_argument("--save-raw", action="store_true",
-                   help="Also write an unfiltered <stem>_raw.nrrd")
-
-    g = p.add_argument_group("Gaussian pre-smoother")
-    g.add_argument("--gauss-sigma", type=float, default=0.5,
-                   help="Gaussian σ in voxels; 0 to disable")
-
-    g = p.add_argument_group("Non-local means filter")
-    g.add_argument("--nlm-patch", type=int, default=5,
-                   help="Half-size of NLM comparison patch (pixels)")
-    g.add_argument("--nlm-search", type=int, default=11,
-                   help="Half-size of NLM search window (pixels)")
-    g.add_argument("--nlm-h", type=float, default=1.0,
-                   help="NLM filter strength as multiple of estimated noise σ; "
-                        "higher → smoother (more blurring)")
-    g.add_argument("--nlm-3d", action="store_true",
-                   help="Run NLM in true 3-D mode (higher quality, much more RAM)")
-
-    g = p.add_argument_group("Median filter")
-    g.add_argument("--median-radius", type=int, default=1,
-                   help="Median filter half-kernel size (voxels); 0 to disable")
-
-    g = p.add_argument_group(
-        "CLAHE contrast enhancement",
-        "Writes a SEPARATE <stem>_enhanced.nrrd for viewing only; the main "
-        "<stem>.nrrd always stays at raw intensities. Boosts local contrast "
-        "(e.g. enamel/dentin boundary) without crushing the rest of the volume "
-        "the way percentile stretching would.",
-    )
-    g.add_argument("--enhance-contrast", action="store_true",
-                   help="Also write a CLAHE-enhanced <stem>_enhanced.nrrd")
-    g.add_argument("--clahe-clip-limit", type=float, default=0.01,
-                   help="CLAHE clip limit; higher → stronger local contrast boost")
-    g.add_argument("--clahe-kernel-size", type=int, default=None,
-                   help="CLAHE tile size in pixels (default: skimage auto, ~1/8 of slice)")
-
-    p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    p.add_argument("--apply-rescale", "--apply-scaling", action="store_true",
+                   dest="apply_rescale",
+                   help="Apply DICOM RescaleSlope/Intercept before filtering, "
+                        "converting stored values to physical units (the DICOM "
+                        "counterpart of convert_ISQ_NRRD.py's --apply-scaling, "
+                        "which is accepted here as an alias)")
+    add_pipeline_arguments(p)
     return p
 
 
 def main() -> None:
     args = _build_parser().parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(message)s",
-        datefmt="%H:%M:%S",
-        handlers=[RichHandler(rich_tracebacks=True, markup=True)],
-    )
+    setup_logging(args.verbose)
 
     dicom_dir: Path = args.dicom_dir
     if not dicom_dir.is_dir():
@@ -490,23 +450,9 @@ def main() -> None:
     outputs = convert(
         dicom_dir,
         output_dir,
-        workers=args.workers,
-        apply_rescale=args.apply_rescale,
-        save_raw=args.save_raw,
-        gauss_sigma=args.gauss_sigma,
-        nlm_patch=args.nlm_patch,
-        nlm_search=args.nlm_search,
-        nlm_h=args.nlm_h,
-        nlm_3d=args.nlm_3d,
-        median_radius=args.median_radius,
-        enhance_contrast=args.enhance_contrast,
-        clahe_clip_limit=args.clahe_clip_limit,
-        clahe_kernel_size=args.clahe_kernel_size,
+        options_from_args(args, apply_rescale=args.apply_rescale),
     )
-
-    log.info("[bold green]Done.[/bold green]  Output files:")
-    for label, path in outputs.items():
-        log.info("  [cyan]%s[/cyan]: %s", label, path)
+    report_outputs(outputs)
 
 
 if __name__ == "__main__":
