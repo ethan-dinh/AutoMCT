@@ -77,7 +77,7 @@ def postprocess_incisor(
         return incisor_mask
 
     original_mask = incisor_mask.astype(bool)
-    struct = ball(1).astype(bool)
+    struct = np.asarray(ball(1), dtype=bool)
     flood_struct = np.ones((3, 3, 3), dtype=bool)
     eroded = original_mask.copy()
 
@@ -321,7 +321,7 @@ def _merge_small_regions(
 
     # Distance transform from large-label region: gives each voxel the
     # (z, y, x) index of its nearest large-label voxel via return_indices.
-    _, nearest_idx = distance_transform_edt(~large_mask, return_indices=True)
+    _, nearest_idx = distance_transform_edt(~large_mask, return_indices=True)  # type: ignore
 
     for sl in small_labels:
         sl_voxels = labels == sl

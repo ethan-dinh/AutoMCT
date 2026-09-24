@@ -136,6 +136,7 @@ def reorient_mandible(
     companion_volumes: Optional[list[np.ndarray]] = None,
     intensity_percentile: float = 95.0,
     debug: bool = False,
+    record: Optional[dict] = None,
 ) -> tuple[np.ndarray, list[np.ndarray]]:
     """
     Crop to the hemimandible bounding box and produce a canonical orientation
@@ -162,6 +163,11 @@ def reorient_mandible(
         original uint8 BMP stack used for final intensity masking).
     intensity_percentile : float
         Percentile used to isolate enamel-level signal for tip detection.
+    record : dict | None
+        If given, populated with the lossless operations applied here (crop
+        bbox, axis permutation, flips). Callers use it to map voxel spacing --
+        or any other array in the input frame -- into the output frame; only
+        ``perm`` and ``swap12`` move data between axes.
 
     Returns
     -------
@@ -170,6 +176,11 @@ def reorient_mandible(
         is None.
     """
     companions: list[np.ndarray] = list(companion_volumes) if companion_volumes else []
+
+    if record is not None:
+        record.clear()
+        record.update({"bbox": None, "perm": None, "flip0": False,
+                       "swap12": False, "flip1": False})
 
     logger.info("Reorientation — computing binary mandible mask")
     mask = _mandible_mask(volume)
@@ -192,6 +203,9 @@ def reorient_mandible(
     mask = mask[bbox].copy()
     companions = [c[bbox].copy() for c in companions]
 
+    if record is not None:
+        record["bbox"] = tuple((int(s_.start), int(s_.stop)) for s_ in bbox)
+
     # ------------------------------------------------------------------
     # Step 2: permute axes so the longest edge is axis 0
     # ------------------------------------------------------------------
@@ -205,6 +219,8 @@ def reorient_mandible(
         volume = np.transpose(volume, perm).copy()
         mask = np.transpose(mask, perm).copy()
         companions = [np.transpose(c, perm).copy() for c in companions]
+        if record is not None:
+            record["perm"] = tuple(int(x) for x in perm)
     else:
         logger.info("Longest dimension already on axis 0 — no permutation needed")
 
@@ -244,6 +260,8 @@ def reorient_mandible(
         volume = np.flip(volume, axis=0).copy()
         companions = [np.flip(c, axis=0).copy() for c in companions]
         tip[0] = (volume.shape[0] - 1) - tip[0]
+        if record is not None:
+            record["flip0"] = True
     else:
         logger.info("Axis 0: tip already at high Z (Z=%.1f >= midpoint %.1f)", tip[0], mid_z)
 
@@ -258,6 +276,8 @@ def reorient_mandible(
         volume = np.swapaxes(volume, 1, 2).copy()
         companions = [np.swapaxes(c, 1, 2).copy() for c in companions]
         tip[1], tip[2] = tip[2], tip[1]
+        if record is not None:
+            record["swap12"] = True
     else:
         logger.info(
             "Axes 1/2: X=%d >= Y=%d — incisor already flat, no swap needed",
@@ -276,6 +296,8 @@ def reorient_mandible(
         volume = np.flip(volume, axis=1).copy()
         companions = [np.flip(c, axis=1).copy() for c in companions]
         tip[1] = (volume.shape[1] - 1) - tip[1]
+        if record is not None:
+            record["flip1"] = True
     else:
         logger.info("Axis 1: tip already at low Y (Y=%.1f <= midpoint %.1f)", tip[1], mid_y)
 

@@ -34,12 +34,36 @@ def normalize_volume(volume: np.ndarray, method: str = "minmax") -> np.ndarray:
 
     Parameters:
         method: 'minmax' (default) or 'zscore'.
+
+    The volume is promoted to float before any arithmetic. Doing the subtraction
+    in the input dtype overflows on an int16 scan that spans the full stored
+    range: a single saturated voxel at -32768 against a maximum of 31840 makes
+    the true span 64608, which wraps to -928 in int16 and silently flips and
+    inflates the whole volume (peak value ~35 instead of 1). That then surfaces
+    far downstream as "Images of type float must be between -1 and 1" from
+    CLAHE, or as a background threshold that keeps 99.9% of voxels -- neither of
+    which points back here.
     """
+    volume = np.asarray(volume, dtype=np.float32)
     if method == "minmax":
-        vmin, vmax = volume.min(), volume.max()
-        return (volume - vmin) / (vmax - vmin)
+        vmin, vmax = float(volume.min()), float(volume.max())
+        span = vmax - vmin
+        if span <= 0:
+            # A constant volume has no contrast to stretch; return zeros rather
+            # than dividing by zero and filling the array with nan.
+            logger.warning(
+                "Volume is constant at %g — min-max normalization returns zeros.", vmin
+            )
+            return np.zeros_like(volume)
+        return (volume - vmin) / span
     elif method == "zscore":
-        mean, std = volume.mean(), volume.std()
+        mean, std = float(volume.mean()), float(volume.std())
+        if std <= 0:
+            logger.warning(
+                "Volume has zero variance at %g — z-score normalization returns zeros.",
+                mean,
+            )
+            return np.zeros_like(volume)
         return (volume - mean) / std
     raise ValueError(f"Unknown normalization method: {method}")
 
@@ -115,7 +139,8 @@ def non_local_means_filter(
 
         return result
 
-    h_use = h if h is not None else float(0.8 * estimate_sigma(volume))
+    # estimate_sigma returns a list only when given a channel_axis.
+    h_use = h if h is not None else float(0.8 * estimate_sigma(volume))  # type: ignore
     return denoise_nl_means(
         volume,
         h=h_use,

@@ -1,3 +1,3 @@
-from .viewers import create_3d_visualization
+from .viewers import SEGMENTATION_COLORS, create_3d_visualization, show_segmentation
 
-__all__ = ["create_3d_visualization"]
+__all__ = ["SEGMENTATION_COLORS", "create_3d_visualization", "show_segmentation"]

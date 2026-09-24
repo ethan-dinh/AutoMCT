@@ -29,9 +29,12 @@ _PKG_ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
 if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
 
+# pylint: disable=wrong-import-position
 from data_io import save_ct_volume_as_tiff, save_mask_as_tiff           # noqa: E402
+from logging_setup import setup_logging                                  # noqa: E402
 from pipeline import segment_mandible                                    # noqa: E402
-from visualization import create_3d_visualization                        # noqa: E402
+from validation import ValidationSummary                                 # noqa: E402
+from visualization import show_segmentation                              # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Optional TUI helper
@@ -68,28 +71,10 @@ def _menu(prompt: str, choices: list[str]) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
-def setup_logging() -> None:
-    """Configure coloured console logging."""
-
-    class ColorFormatter(logging.Formatter):
-        COLORS = {
-            "DEBUG": "\033[94m",
-            "INFO": "\033[92m",
-            "WARNING": "\033[93m",
-            "ERROR": "\033[91m",
-            "CRITICAL": "\033[95m",
-        }
-        RESET = "\033[0m"
-
-        def format(self, record):
-            color = self.COLORS.get(record.levelname, self.RESET)
-            record.levelname = f"{color}{record.levelname}{self.RESET}"
-            return super().format(record)
-
-    handler = logging.StreamHandler()
-    handler.setFormatter(ColorFormatter("[%(levelname)s] - %(message)s"))
-    logging.basicConfig(level=logging.INFO, handlers=[handler])
-
+# An interactive menu loop: each branch is one of the user's choices
+# (accept / re-segment / skip / back / quit) at each of two prompts, so the
+# count reflects the UI's shape rather than tangled logic.
+# pylint: disable=too-many-branches
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Interactive mandible segmentation TUI"
@@ -159,7 +144,11 @@ def main() -> None:
         while True:
             print(f"\n[INFO] Segmenting {pick} ...")
             try:
-                result = segment_mandible(sample_path, debug=args.debug, cache_dir=args.cache_dir)
+                sample_checks = ValidationSummary().sample(pick)
+                result = segment_mandible(
+                    sample_path, debug=args.debug, cache_dir=args.cache_dir,
+                    validation=sample_checks,
+                )
             except Exception:
                 print(f"[ERROR] Pipeline failed for {pick}:")
                 traceback.print_exc()
@@ -188,18 +177,23 @@ def main() -> None:
 
             reoriented, preprocessed, incisor, bone, molar = result
 
-            create_3d_visualization(
-                preprocessed,
-                additional_volumes={
-                    "Incisor": (incisor, "orange"),
-                    "Bone":    (bone,    "grey"),
-                    "Molar":   (molar,   "cyan"),
-                },
-            )
+            show_segmentation(preprocessed, incisor, bone, molar)
+
+            # Put the verdict in the prompt itself. The napari window above
+            # shows the result but not what is wrong with it, and this is the
+            # moment the accept/re-segment call is actually being made.
+            status = sample_checks.status
+            problems = sample_checks.problems
+            if problems:
+                print(f"\n[{status}] {len(problems)} check(s) flagged for {pick}:")
+                for stage, name, message in problems:
+                    print(f"  - [{stage}] {name}: {message}")
+            else:
+                print(f"\n[OK] All checks passed for {pick}.")
 
             try:
                 action = _menu(
-                    f"Result for {pick}:",
+                    f"Result for {pick} (checks: {status}):",
                     ["Accept", "Re-segment", "Skip", "Back to list", "Quit"],
                 )
             except KeyboardInterrupt:

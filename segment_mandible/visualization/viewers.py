@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 def create_3d_visualization(
     volume: np.ndarray,
+    *,
     labeled_volume: Optional[np.ndarray] = None,
     additional_volumes: Optional[Mapping[str, Tuple[Optional[np.ndarray], str]]] = None,
     slice_range: Optional[Tuple[int, int]] = None,
@@ -65,3 +66,42 @@ def create_3d_visualization(
                 pass
         del viewer
         gc.collect()
+
+
+# The colours below are the convention across the CLI and the test TUI, so a
+# result looks the same wherever it is opened. Defined once here rather than
+# spelled out at each call site.
+SEGMENTATION_COLORS = {
+    "Incisor": "orange",
+    "Bone": "grey",
+    "Molar": "cyan",
+}
+
+
+def show_segmentation(
+    background: np.ndarray,
+    incisor: Optional[np.ndarray] = None,
+    bone: Optional[np.ndarray] = None,
+    molar: Optional[np.ndarray] = None,
+    *,
+    title: str = "napari",
+) -> None:
+    """
+    Open the standard three-structure overlay on a grayscale background.
+
+    Parameters:
+        background: Volume to show underneath, usually the preprocessed or
+            reoriented scan.
+        incisor, bone, molar: Segmented volumes. Any that are None are skipped,
+            so this also serves a partially-loaded result.
+    """
+    create_3d_visualization(
+        background,
+        additional_volumes={
+            name: (volume, SEGMENTATION_COLORS[name])
+            for name, volume in (
+                ("Incisor", incisor), ("Bone", bone), ("Molar", molar)
+            )
+        },
+        title=title,
+    )
