@@ -158,3 +158,6 @@ events.out.tfevents.*
 /poster_assets/*.u16
 /poster_assets/*.u16.gz
 /poster_assets/*.u16.gz.part*
+
+# Claude
+.claude/*
