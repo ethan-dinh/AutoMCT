@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MicroCT Studio</title>
+  <meta name="description" content="Import, convert, crop, segment and quantify mouse mandible microCT scans.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d5c63'/%3E%3Cpath d='M9 23c1-8 4-13 8-14 3-1 5 1 6 4' stroke='%23fff' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/css/app.css">
+  <script>
+    // Apply the saved theme before first paint, so a dark-mode user never sees a white flash.
+    try { const t = localStorage.getItem("studio.theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}
+  </script>
+</head>
+<body>
+  <a class="skip" href="#view">Skip to content</a>
+  <div class="shell">
+    <nav class="rail" aria-label="Main">
+      <a class="brand" href="#/">
+        <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7"/><path d="M9 23c1-8 4-13 8-14 3-1 5 1 6 4"/></svg>
+        <span>MicroCT Studio</span>
+      </a>
+      <div class="rail-links" id="rail-links"></div>
+      <div class="rail-foot" id="rail-foot"></div>
+    </nav>
+    <main id="view" tabindex="-1"></main>
+  </div>
+  <div id="toasts" role="status" aria-live="polite"></div>
+  <div id="modal-root"></div>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
