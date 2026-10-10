@@ -1,0 +1,33 @@
+# Docker Compose wrapper: builds the image and mounts your folders.
+#
+#   docker compose -f super_resolution/compose.yaml build
+#   docker compose -f super_resolution/compose.yaml run --rm sr check
+#   docker compose -f super_resolution/compose.yaml run --rm sr segment -i /data/<scan>.nrrd -o /results
+#
+# Host folders come from super_resolution/.env (copy .env.example); relative
+# paths are relative to this file. Inside the container they are:
+#   /data     scans (read-only)          /results  segmentation outputs
+#   /models   trained models             /work     temporary upscaled volumes
+#
+# No NVIDIA GPU? Delete the `deploy:` block to run on the CPU (slow).
+
+services:
+  sr:
+    build:
+      context: ..
+      dockerfile: super_resolution/Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime}
+    image: microct-sr:latest
+    volumes:
+      - ${DATA_DIR:-../data}:/data:ro
+      - ${RESULTS_DIR:-./runs/results}:/results
+      - ${MODELS_DIR:-./runs/models}:/models
+      - ${WORK_DIR:-./runs/work}:/work
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

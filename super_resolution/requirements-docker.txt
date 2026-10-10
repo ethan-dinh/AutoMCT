@@ -1,0 +1,23 @@
+# Python packages the Docker image installs on top of the PyTorch base image.
+# torch is deliberately absent: the base image provides a build matched to
+# its CUDA version, and reinstalling it from PyPI could replace that.
+#
+# The conda environment (env/environment.yml) already has all of these;
+# this file is only for the image.
+
+# segment_mandible
+numpy
+scipy
+scikit-image
+tifffile
+pynrrd
+pydicom>=2.4
+pillow
+tqdm
+rich
+
+# super_resolution
+psutil
+
+# To run the test suite inside the container
+pytest

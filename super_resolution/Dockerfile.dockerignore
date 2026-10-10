@@ -1,0 +1,15 @@
+# Build context is the repository root, which also holds data/ and model
+# runs (many GB). Send only the two packages the image needs.
+#
+# BuildKit (the default builder since Docker 23) reads this file because it
+# sits next to the Dockerfile and is named after it.
+*
+!segment_mandible
+!super_resolution
+
+**/__pycache__
+**/*.pyc
+**/.DS_Store
+**/._*
+segment_mandible/tests
+super_resolution/.env
