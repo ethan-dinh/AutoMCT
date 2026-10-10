@@ -1,43 +1,160 @@
-# Ignore macos files
+# MicroCT-Analysis: local environments, generated data, and development artifacts.
+# These rules do not untrack files already committed to Git.
+
+# Operating-system metadata
 .DS_Store
 ._*
+.AppleDouble/
+.LSOverride
+.Spotlight-V100/
+.Trashes/
+__MACOSX/
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
 
-# Ignore python files
+# Python bytecode, native extensions, and tool caches
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+*.so
 *.pyd
-*.pyw
-*.pyz
+*.nbc
+*.nbi
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
 
-# Ignore library files
+# Virtual environments (env/ contains versioned Conda documentation)
+.venv/
+venv/
+venv.bak/
+.conda/
+.python-version
+.direnv/
+/env/*
+!/env/README.md
+!/env/environment.yml
+
+# Python packaging and build artifacts
+build/
+dist/
 *.egg-info/
 *.egg
+.eggs/
+pip-wheel-metadata/
+wheelhouse/
+.installed.cfg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
 
-# Ignore vscode files
-.vscode/
+# Test coverage and generated reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+coverage/
+nosetests.xml
+junit.xml
+*.cover
+*.py,cover
 
-# Ignore data files
-*/data/
-data/
+# Jupyter and IPython runtime state (keep notebooks)
+.ipynb_checkpoints/
+.ipython/
+profile_default/
 
-# Ignore results files
-*/results/
+# R session state and local package libraries (keep R/Rmd source)
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+.Rcache/
+renv/library/
+renv/staging/
+
+# JavaScript dependencies and build caches (keep lockfiles)
+node_modules/
+.npm/
+.parcel-cache/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor state and temporary files
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.code-workspace
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+*.temp
+~$*
+.claude/settings.local.json
+
+# Local secrets and configuration (keep documented examples)
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.envrc
+.aws/
+*.pem
+*.key
+
+# Logs and temporary work directories
+*.log
+*.log.*
+logs/
+tmp/
+temp/
+
+# Generated analysis data: use these directories for local scans and exports.
+# Avoid global image/CSV/JSON rules so figures, fixtures, and configs stay visible.
+/data/
+/datasets/
+/scans/
+output/
+outputs/
 results/
-mandible_analysis/scripts/segment_mandible/segmentation_results/
-*.html
+segmentation_results/
+_sr_work/
 
-# Ignore test files
-test_results.json
-cli_test_results.json
-/segment_mandible/tests/segmentation_results/
+# Training runs, model weights, and experiment tracking
+/ML-Segmentation/runs/*
+/ML-Segmentation/runs_*/
+checkpoints/
+lightning_logs/
+wandb/
+mlruns/
+mlartifacts/
+events.out.tfevents.*
+*.pt
+*.pth
+*.ckpt
+*.onnx
 
-# Ignore cache files
-**/.det_cache/
-
-# Ignore training files
-*/training/
-
-# Ignore Claude Files
-.claude/
-CLAUDE.md
+# Large generated poster volume payloads (keep accompanying source/metadata)
+/poster_assets/*.bin
+/poster_assets/*.u16
+/poster_assets/*.u16.gz
+/poster_assets/*.u16.gz.part*
