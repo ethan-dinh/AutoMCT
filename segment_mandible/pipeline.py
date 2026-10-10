@@ -30,6 +30,7 @@ from preprocessing import (
     tv_denoise_volume,
 )
 from segmentation import (
+    incisor_basin,
     polish_incisor_mask,
     recover_cervical_loop,
     recover_low_density_margin,
@@ -49,6 +50,7 @@ from validation import (
     check_preprocessed_volume,
     check_reorientation,
     check_shrink,
+    find_area_spikes,
 )
 from visualization import create_3d_visualization
 
@@ -597,7 +599,8 @@ def _run_segmentation(
         # conservative volume and hand segment_molar_bone nothing; fall back to
         # the background/bone knee, which is the threshold that already
         # defined this volume's foreground.
-        if not np.isfinite(conservative_incisor_threshold):
+        descent_found = bool(np.isfinite(conservative_incisor_threshold))
+        if not descent_found:
             logger.warning(
                 "Threshold descent found no incisor; using the "
                 "background/bone knee %.4g for the conservative volume.",
@@ -677,6 +680,53 @@ def _run_segmentation(
             incisor_segmentation_volume, min_bone_intensity * 1.25,
             seed_out=seed_info,
         )
+
+        # A leak onto bone shows up as a stretch of slices where the tracked
+        # cross-section stands far above the jaw around it: on P42_WT_WT_1 the
+        # tracker took in a ring of alveolar bone and doubled for 60 slices.
+        # It happens where the bone is as dense as the dentin, so the per-slice
+        # threshold cannot part them. There, track again with the watershed
+        # veto, which keeps each slice from adding bone the tooth did not hold
+        # on the slice before. A mask without spikes is left exactly as the
+        # tracker made it.
+        slice_mm = float(shrink_spacing[0]) if shrink_spacing is not None else None
+        spikes = find_area_spikes(
+            full_incisor_mask.reshape(full_incisor_mask.shape[0], -1).sum(axis=1),
+            slice_mm=slice_mm,
+        )
+        if spikes and descent_found and conserve_incisor_mask.any():
+            logger.warning(
+                "Incisor cross-section spikes at slices %s (%d voxels over the "
+                "running median); tracking again with a watershed veto",
+                ", ".join(s.describe() for s in spikes), sum(s.excess for s in spikes),
+            )
+            basin = incisor_basin(
+                normalized_volume, conserve_incisor_mask, conservative_volume > 0,
+                preprocessed_volume > 0, near=full_incisor_mask,
+            )
+            retrack_seed: dict = {}
+            retracked = segment_incisor(
+                incisor_segmentation_volume, min_bone_intensity * 1.25,
+                seed_out=retrack_seed, veto=basin,
+            )
+            del basin
+            remaining = find_area_spikes(
+                retracked.reshape(retracked.shape[0], -1).sum(axis=1),
+                slice_mm=slice_mm,
+            )
+            if retracked.any() and sum(s.excess for s in remaining) < sum(s.excess for s in spikes):
+                logger.info(
+                    "Re-tracked incisor: %d voxels (was %d); spikes left: %s",
+                    int(retracked.sum()), int(full_incisor_mask.sum()),
+                    ", ".join(s.describe() for s in remaining) or "none",
+                )
+                full_incisor_mask, seed_info = retracked, retrack_seed
+            else:
+                logger.warning(
+                    "Re-tracking with the veto did not reduce the spikes; "
+                    "keeping the first mask",
+                )
+            del retracked
     except Exception as e:
         logger.error("Error segmenting incisor: %s", e)
         return None

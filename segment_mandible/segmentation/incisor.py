@@ -273,10 +273,71 @@ def _smallest_voxel_step(spacing: tuple[float, float, float] | None) -> float:
     return 1.0 if spacing is None else min(spacing)
 
 
+def incisor_basin(
+    volume: np.ndarray,
+    incisor_core: np.ndarray,
+    other_core: np.ndarray,
+    foreground: np.ndarray,
+    *,
+    near: np.ndarray | None = None,
+    margin_voxels: int = 24,
+) -> np.ndarray:
+    """
+    The voxels the incisor holds against the bone round it, by a marker
+    watershed on intensity.
+
+    Where the alveolar bone is as dense as the incisor's dentin, no threshold
+    tells them apart -- on P42_WT_WT_1, 66% of the bone within 0.2 mm of the
+    incisor is brighter than the dentin's median, against 3% on P22_TGM2_WT_M_4.
+    What still parts them is the periodontal ligament, a dark sleeve round the
+    tooth. Flooding the inverted intensity from markers on either side puts the
+    boundary along it: each voxel goes to whichever side reaches it through
+    brighter tissue, so the bone is claimed from the bone before the incisor's
+    flood can cross the gap. ``incisor_core`` marks the tooth (the threshold
+    descent's mask, which stops before fusing with bone) and ``other_core``
+    marks what is certainly not tooth (the bone and molars above the descent's
+    threshold).
+
+    The flood is not trusted everywhere. Where the dentin is dimmer than the
+    bone it touches and the ligament is lost to blur, the bone's flood reaches
+    the tooth first and claims part of it (on P42 a wedge of the dentin at a
+    trabecular contact). So this is a veto on what the slice tracker may add,
+    not a segmentation: see ``veto`` in segment_incisor.
+
+    Only the box round ``incisor_core`` (and ``near``, when given) padded by
+    ``margin_voxels`` is flooded; everything outside it is outside the basin.
+
+    Returns:
+        Boolean mask of the incisor's basin, inside the foreground.
+    """
+    seeds = incisor_core if near is None else (incisor_core | near)
+    found = ndi.find_objects(seeds.astype(np.uint8))
+    if not found or found[0] is None:
+        return np.zeros(volume.shape, dtype=bool)
+    box = tuple(
+        slice(max(s.start - margin_voxels, 0), min(s.stop + margin_voxels, n))
+        for s, n in zip(found[0], volume.shape)
+    )
+    inside = foreground[box]
+    markers = np.zeros(inside.shape, dtype=np.int32)
+    markers[other_core[box] & inside] = 2
+    markers[incisor_core[box]] = 1
+    flooded = watershed(-np.asarray(volume[box], dtype=np.float32), markers=markers, mask=inside)
+
+    basin = np.zeros(volume.shape, dtype=bool)
+    basin[box] = flooded == 1
+    logger.info(
+        "Incisor basin: %d voxels flooded from %d core voxels against %d bone/molar marker voxels",
+        int(basin.sum()), int(incisor_core.sum()), int((markers == 2).sum()),
+    )
+    return basin
+
+
 def segment_incisor(
     preprocessed_volume: np.ndarray,
     min_tip_intensity: float,
     seed_out: dict | None = None,
+    veto: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Segment the incisor from the mandible volume.
@@ -287,6 +348,14 @@ def segment_incisor(
             caller can check the seed independently of the mask it produced. A
             wrong seed yields a mask that looks entirely plausible, so it is
             worth validating on its own.
+        veto: Optional boolean volume, the incisor's watershed basin (see
+            incisor_basin). When given, a slice may only add voxels it did not
+            hold on the slice before if they lie in the basin. A leak starts
+            exactly so: the bone a slice merges with was never part of the
+            tooth on the slice before. Voxels the tooth already held are
+            kept whatever the basin says, so a stretch where the basin is
+            wrong about the tooth (dentin dimmer than the bone it touches)
+            costs nothing as long as the tracker had it right on the way in.
     """
     def _try_erode_separate(
         mask_2d: np.ndarray, ref_centroid: np.ndarray, max_iters: int = 15
@@ -348,6 +417,9 @@ def segment_incisor(
 
     prev_centroid = None
     prev_area = None
+    prev_mask = None
+    vetoed_voxels = 0
+    vetoed_slices = 0
     seed_found = False
 
     area_jump_factor = 1.25
@@ -415,10 +487,28 @@ def segment_incisor(
             else:
                 logger.debug("Separation failed on slice %d; keeping merged region", z)
 
+        if veto is not None and prev_mask is not None:
+            blocked = slice_mask_full & ~prev_mask & ~veto[z]
+            if blocked.any():
+                kept = slice_mask_full & ~blocked
+                # Keep only what still joins the tooth of the slice before:
+                # cutting the merged bone away can strand slivers of it.
+                pieces, _ = ndi.label(kept)  # type: ignore[misc]
+                joined = np.unique(pieces[kept & prev_mask])
+                joined = joined[joined > 0]
+                if joined.size:
+                    kept = np.isin(pieces, joined)
+                if kept.any():
+                    vetoed_voxels += int(np.count_nonzero(slice_mask_full & ~kept))
+                    vetoed_slices += 1
+                    slice_mask_full = kept
+                    current_area = int(np.count_nonzero(slice_mask_full))
+
         rough_mask[z] = slice_mask_full
         ys, xs = np.where(slice_mask_full)
         prev_centroid = np.array([ys.mean(), xs.mean()])
         prev_area = current_area
+        prev_mask = slice_mask_full
 
         if seed_found and not np.any(seed_mask_3d):
             seed_mask_3d[z] = slice_mask_full
@@ -429,6 +519,11 @@ def segment_incisor(
         "Slice tracking followed the incisor across %d of %d slices",
         tracked_slices, volume_shape[0],
     )
+    if veto is not None:
+        logger.info(
+            "Watershed veto kept %d voxels of bone out of the incisor on %d slice(s)",
+            vetoed_voxels, vetoed_slices,
+        )
 
     if not np.any(seed_mask_3d):
         logger.warning(

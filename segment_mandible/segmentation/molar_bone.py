@@ -62,6 +62,17 @@ _ANCHOR_MARGIN_FRACTION = 0.04
 # roots with them.
 _ANCHOR_ATTACHED_SHARE = 0.1
 
+# ...and the molars count as still fused to bone only while the components
+# that hold the anchor carry at least this share of the enamel. Less than that
+# is not a tooth but a dense patch of bone that reached the enamel threshold:
+# it is part of the bone at every level, so waiting for it to "detach" climbs
+# until only the enamel caps are left. On P42_WT_WT_1 (no enamel peak, knee
+# threshold 0.58) a 4,586-voxel patch of cortical bone, 0.8% of the enamel,
+# held the search up to 0.551; without it the molars part from bone at 0.307
+# and keep their dentin and roots (0.75M -> 3.0M core voxels). The smallest
+# real tooth, M3, carries 11.5-16.4% of the enamel on the P22 scans.
+_FUSED_ENAMEL_MIN_SHARE = 0.03
+
 # Coarse step of the separation search, as a fraction of the range between
 # the foreground floor and the enamel threshold, and the bisection tolerance.
 _SEPARATION_COARSE_FRACTION = 0.1
@@ -70,6 +81,65 @@ _SEPARATION_FINE_FRACTION = 0.005
 # Thickness, in voxels, of the shell the molar mask may regrow into after
 # separation. See _regrow_molar_rim.
 _MOLAR_RIM_VOXELS = 2
+
+# Background trim (see _trim_attached_background). Molar voxels dimmer than
+# the tissue floor are kept only within this many voxels of brighter tooth,
+# which is the blurred surface of the tooth itself. On WT-M-1 (denoised) the
+# surface ramps from background to dentin over ~3-4 voxels; 2 was picked by
+# eye over 3 and 4 as the cut that leaves the crowns cleanest.
+_BACKGROUND_RIM_VOXELS = 2
+
+# A piece of dim material is background only if it comes within this many
+# voxels of enamel, i.e. it rests on the crown. On WT-M-1, soft tissue coating
+# the crowns comes within ~4.5 voxels of enamel, while the dim lining of the
+# pulp chamber never comes closer than 12 (dentin lies in between) and root
+# tips sit 16-150 voxels away.
+_BACKGROUND_ENAMEL_CONTACT_VOXELS = 5
+
+# ...and within a piece that rests on the crown, only voxels this close to
+# enamel are removed. A dim sheet can run from the crown down a root surface
+# to the dim, tapering root tip, joining both into one piece; the cap stops
+# the trim partway. It trades completeness for cleanliness: at 15 every root
+# tip on WT-M-1 survived, but the crowns kept visible background; at 30 the
+# crowns come out clean and the dimmest end of a root arm lying within 30
+# voxels of enamel is trimmed with it.
+_BACKGROUND_ENAMEL_REACH_VOXELS = 30
+
+# Everywhere on the tooth -- crown, roots, pulp walls -- molar voxels below
+# this fraction of the way from the separation threshold up to the tissue
+# floor are background, with no position test. On WT-M-1 that is 0.230: the
+# faintest ~1-voxel skin (0.15-0.23), which was judged by eye to be background
+# all round the tooth. It also undoes _regrow_molar_rim, whose voxels all sit
+# below the separation threshold; the regrowth still decides which of them
+# are kept out of the bone mask.
+_BACKGROUND_SURFACE_CUT_FRACTION = 0.5
+
+# Bone cleanup (see clean_bone_mask). The foreground the bone mask is cut from
+# starts at the background/bone knee, which lets in the soft tissue round the
+# teeth -- the incisor's pulp, the periodontal space, the gingiva on the
+# crowns -- at under half the density of bone. On the 13 P22 TGM2 scans it was
+# 30-43% of the bone mask: a soft-tissue mode at 4,500-5,500 (scanner units)
+# beside bone's at 10,200-11,900, parted by a valley at 6,900-7,900.
+#
+# A mode must stand this far out of the smoothed histogram, as a fraction of
+# its tallest bin, to count.
+_BONE_PEAK_MIN_PROMINENCE = 0.05
+
+# The valley must dip below this fraction of the soft-tissue side (its peak,
+# or the histogram's low edge where soft tissue shows only as a falling edge)
+# to be cut at. The two modes overlap through the partial-volume surface of
+# the bone, so the dip is shallow: to 0.50-0.86 of the soft-tissue peak on
+# the P22 scans. A mask that is already clean rises from its low edge straight
+# to the bone peak, with no dip at all, so it is left as it is: cleaning the
+# 13 cleaned masks again removed nothing.
+_BONE_FLOOR_MAX_DIP = 0.95
+
+# ...and the soft-tissue mode must sit in the lower part of the range below
+# bone: at most this fraction of the way from the histogram's low end up to
+# the bone peak (0.39-0.54 on the P22 scans). A mode just under the bone peak
+# is more bone -- trabecular beside cortical, say -- not soft tissue, and is
+# not cut away.
+_BONE_SOFT_MAX_POSITION = 0.6
 
 
 def _plot_enamel_threshold_histogram(
@@ -108,6 +178,7 @@ def _find_enamel_threshold(
     smooth_sigma: float = _ENAMEL_THRESH_SMOOTH_SIGMA,
     min_log_prominence: float = _ENAMEL_MIN_LOG_PROMINENCE,
     debug: bool = False,
+    info: dict | None = None,
 ) -> float:
     """
     Locate the enamel intensity threshold at the histogram valley below the
@@ -128,8 +199,13 @@ def _find_enamel_threshold(
     brighter half of its peak.
 
     Falls back to the older knee-and-tail method when no log peak exists.
+    ``info``, when given, is told which way the threshold was found
+    (``info["method"]``): "log-valley", "knee", or "max-fraction" (a share of
+    the brightest value, when the histogram has no usable peak at all).
     """
     fallback = float(fg_vals.max() * _ENAMEL_THRESH_FALLBACK_FRACTION) if fg_vals.size else 0.0
+    if info is not None:
+        info["method"] = "max-fraction"
     if fg_vals.size == 0:
         return fallback
 
@@ -160,7 +236,11 @@ def _find_enamel_threshold(
             "the bone peak (%.4f) — falling back to the knee method",
             float(bin_centres[bone_idx]),
         )
-        return _find_enamel_threshold_by_knee(fg_vals, nbins, smooth_sigma, debug=debug)
+        threshold = _find_enamel_threshold_by_knee(fg_vals, nbins, smooth_sigma, debug=debug)
+        if info is not None:
+            # The knee method's own last resort is the same share of the brightest value.
+            info["method"] = "max-fraction" if threshold == fallback else "knee"
+        return threshold
 
     # Brightest candidate: enamel is the densest tissue, and a dentin shoulder
     # that happens to clear the prominence bar sits to its left.
@@ -182,6 +262,8 @@ def _find_enamel_threshold(
             peak_idx=bone_idx, threshold=threshold, enamel_idx=enamel_idx,
         )
 
+    if info is not None:
+        info["method"] = "log-valley"
     return threshold
 
 
@@ -352,6 +434,22 @@ def _bone_anchor(
     return anchor
 
 
+def _fused_with_bone(
+    labels: np.ndarray,
+    ids: np.ndarray,
+    anchor: np.ndarray,
+    attached_share: float = _ANCHOR_ATTACHED_SHARE,
+) -> np.ndarray:
+    """
+    The components among ``ids`` that are still part of the bone: each holds
+    at least ``attached_share`` of the anchor voxels that are labelled at all
+    (those above the threshold ``labels`` was taken at).
+    """
+    counts = np.bincount(labels[anchor], minlength=int(labels.max()) + 1)
+    counts[0] = 0
+    return ids[counts[ids] >= attached_share * max(int(counts.sum()), 1)]
+
+
 def _find_molar_separation_threshold(
     volume: np.ndarray,
     enamel_mask: np.ndarray,
@@ -361,12 +459,15 @@ def _find_molar_separation_threshold(
     coarse_fraction: float = _SEPARATION_COARSE_FRACTION,
     fine_fraction: float = _SEPARATION_FINE_FRACTION,
     attached_share: float = _ANCHOR_ATTACHED_SHARE,
+    enamel_share: float = _FUSED_ENAMEL_MIN_SHARE,
 ) -> tuple[Optional[np.ndarray], float, int]:
     """
     Find the lowest intensity threshold at which no enamel-bearing component
     is still part of the bone -- i.e. holds ``attached_share`` or more of the
     above-threshold anchor -- by a coarse ascending sweep followed by
-    bisection.
+    bisection. Components that do hold the anchor but carry under
+    ``enamel_share`` of the enamel are dense bone, not teeth, and do not keep
+    the search climbing (see _FUSED_ENAMEL_MIN_SHARE).
 
     Dentin and bone overlap in intensity, so there is no single level that
     cuts cleanly everywhere; but raising the threshold only ever removes
@@ -402,10 +503,14 @@ def _find_molar_separation_threshold(
             float(anchor_counts[enamel_ids].max()) / total
             if total and enamel_ids.size else 0.0
         )
-        attached = share >= attached_share
+        fused = enamel_ids[anchor_counts[enamel_ids] >= attached_share * total] \
+            if total else enamel_ids[:0]
+        held = float(enamel_counts[fused].sum()) / max(int(enamel_counts.sum()), 1)
+        attached = share >= attached_share and held >= enamel_share
         logger.debug(
             "Molar separation probe: threshold=%.4f -> enamel component holds "
-            "%.2f%% of the bone anchor (attached=%s)", t, 100.0 * share, attached,
+            "%.2f%% of the bone anchor, fused components carry %.2f%% of the "
+            "enamel (attached=%s)", t, 100.0 * share, 100.0 * held, attached,
         )
         return attached, labels
 
@@ -487,6 +592,243 @@ def _regrow_molar_rim(
     return out
 
 
+def _find_tissue_floor(
+    molar_vals: np.ndarray,
+    low: float,
+    high: float,
+    nbins: int = _ENAMEL_THRESH_NBINS,
+    smooth_sigma: float = _ENAMEL_THRESH_SMOOTH_SIGMA,
+) -> Optional[float]:
+    """
+    The intensity below which a molar voxel is not solid tooth: the valley
+    between the dim mode of the molar mask's histogram and its dentin peak.
+
+    The dim mode is everything the separation threshold let in that is not
+    dentin or enamel -- soft tissue resting on the crown and the blurred
+    surface of the tooth. On WT-M-1 the valley sits at 0.275 against a dentin
+    peak at 0.51; the pipeline's bone floor on the same scan is 0.273.
+
+    The histogram spans ``low`` (the separation threshold) to ``high`` (the
+    enamel threshold), so the enamel peak cannot outrank dentin. On WT-M-1
+    the dim mode is not a peak but a falling edge from ``low``; when it is a
+    peak of its own, the valley is searched right of it, since the stretch
+    between ``low`` and that peak can be emptier than the valley itself.
+    Returns None when there is no dentin peak to anchor the valley.
+    """
+    counts, edges = np.histogram(molar_vals, bins=nbins, range=(low, high))
+    smoothed = gaussian_filter1d(counts.astype(np.float64), sigma=smooth_sigma)
+    peaks, props = find_peaks(smoothed, prominence=max(float(smoothed.max()) * 0.05, 1e-8))
+    if not len(peaks):
+        return None
+    dentin_idx = int(peaks[np.argmax(props["prominences"])])
+    left_bound = max([int(p) for p in peaks if p < dentin_idx] + [0])
+    valley_idx = left_bound + int(np.argmin(smoothed[left_bound:dentin_idx + 1]))
+    return float((edges[valley_idx] + edges[valley_idx + 1]) / 2.0)
+
+
+def _trim_attached_background(
+    volume: np.ndarray,
+    molar: np.ndarray,
+    enamel_mask: np.ndarray,
+    low: float,
+    high: float,
+    tissue_floor: Optional[float] = None,
+    rim_voxels: int = _BACKGROUND_RIM_VOXELS,
+    contact_voxels: int = _BACKGROUND_ENAMEL_CONTACT_VOXELS,
+    reach_voxels: int = _BACKGROUND_ENAMEL_REACH_VOXELS,
+    surface_cut_fraction: float = _BACKGROUND_SURFACE_CUT_FRACTION,
+) -> np.ndarray:
+    """
+    Remove the dim background that comes away with the molars.
+
+    The separation threshold is low -- 0.18 on WT-M-1, under the bone floor
+    of 0.27 -- because it is the lowest level at which the molars let go of
+    bone, and so the molar components still hold whatever dim material
+    touches them: soft tissue and debris on the crowns, which shows as a
+    lumpy coating, and a faint skin all round the tooth.
+
+    The faint skin goes wherever it is: every voxel below
+    ``surface_cut_fraction`` of the way from ``low`` up to the tissue floor
+    (``tissue_floor``, or ``_find_tissue_floor`` when not given).
+
+    Above that cut, dim material (below the tissue floor) is still a mix. The
+    tooth's own blurred surface, the tapering root tips and the dim lining of
+    the pulp chamber must stay; the coating on the crowns must go. They are
+    told apart by where they sit:
+
+    - The blurred surface lies within ``rim_voxels`` of solid tooth. Only dim
+      voxels farther out than that are candidates.
+    - Background rests on the crown, which is where the enamel is. A
+      connected piece of candidates is background only if it comes within
+      ``contact_voxels`` of enamel. The pulp lining is walled off from enamel
+      by dentin, and root tips are far from it.
+    - Within such a piece, only voxels within ``reach_voxels`` of enamel are
+      removed, so a dim sheet running down a root surface does not carry the
+      trim to the root tip.
+
+    Anything left disconnected from an enamel-bearing molar afterwards was
+    joined to it only through background and goes too. Measured on WT-M-1
+    with the defaults: 1.04M of 6.38M voxels removed (16.3%). Nearly all of
+    it is under the surface cut -- a voxel-deep skin over the whole tooth,
+    plus most of the crown coating -- and the position test adds the ~5k
+    voxels of coating brighter than the cut.
+    """
+    if not molar.any() or not enamel_mask.any():
+        return molar
+
+    box = ndi.find_objects(molar.astype(np.uint8))[0]
+    box = tuple(slice(max(s.start - 1, 0), min(s.stop + 1, n)) for s, n in zip(box, molar.shape))
+    mol = molar[box]
+    vol = volume[box]
+    enamel = enamel_mask[box] & mol
+
+    floor = tissue_floor if tissue_floor is not None else _find_tissue_floor(vol[mol], low, high)
+    if floor is None or not enamel.any():
+        logger.warning("Background trim: no dentin peak in the molar histogram — skipping")
+        return molar
+
+    surface_cut = low + surface_cut_fraction * (floor - low)
+    faint = mol & (vol < surface_cut)
+
+    solid = mol & (vol > floor)
+    dim = mol & (
+        np.asarray(ndi.distance_transform_edt(~solid), dtype=np.float64) > rim_voxels
+    )
+    del solid
+
+    background = np.zeros_like(mol)
+    n_resting = n_pieces = 0
+    if dim.any():
+        enamel_dist: np.ndarray = np.asarray(
+            ndi.distance_transform_edt(~enamel), dtype=np.float64
+        )
+        pieces, n_pieces = ndi.label(dim, structure=ndi.generate_binary_structure(3, 3))  # type: ignore
+        resting = np.unique(pieces[dim & (enamel_dist <= contact_voxels)])
+        resting = resting[resting > 0]
+        n_resting = resting.size
+        background = np.isin(pieces, resting) & (enamel_dist <= reach_voxels)
+        del pieces, enamel_dist
+    del dim
+
+    trimmed = mol & ~background & ~faint
+    labels, n = ndi.label(trimmed, structure=ndi.generate_binary_structure(3, 1))  # type: ignore
+    sizes = np.bincount(labels.ravel(), minlength=n + 1)
+    enamel_counts = np.bincount(labels[enamel], minlength=n + 1)
+    keep = np.flatnonzero((enamel_counts > 0) & (sizes >= MIN_COMPONENT_SIZE))
+    keep = keep[keep > 0]
+    trimmed = np.isin(labels, keep)
+    del labels
+
+    n_faint = int(faint.sum())
+    n_coating = int((background & ~faint).sum())
+    n_detached = int(mol.sum()) - n_faint - n_coating - int(trimmed.sum())
+    logger.info(
+        "Background trim: tissue floor %.4f, surface cut %.4f -> %d faint-skin "
+        "voxels removed; %d of %d dim piece(s) rest on the crowns -> %d more; "
+        "%d left detached (%.2f%% of the molar mask in all)",
+        floor, surface_cut, n_faint, n_resting, n_pieces, n_coating, n_detached,
+        100.0 * (n_faint + n_coating + n_detached) / max(int(mol.sum()), 1),
+    )
+
+    out = molar.copy()
+    out[box] = trimmed
+    return out
+
+
+def find_bone_floor(
+    values: np.ndarray,
+    low: float,
+    high: float,
+    nbins: int = _ENAMEL_THRESH_NBINS,
+    smooth_sigma: float = _ENAMEL_THRESH_SMOOTH_SIGMA,
+) -> Optional[float]:
+    """
+    The intensity below which a bone-mask voxel is soft tissue: the valley
+    under the bone peak of the mask's histogram, or None when there is none.
+
+    Bone is the brightest mode between ``low`` and ``high``. Soft tissue is the
+    tallest mode below it, or, where it shows only as a falling edge from
+    ``low``, that edge. The valley between them is where the density is least
+    common, which is also where the partial-volume surface of bone is cut
+    halfway, as a threshold between two materials should cut it. None when
+    the histogram does not dip below ``_BONE_FLOOR_MAX_DIP`` of the soft
+    tissue side -- no soft tissue, or a mask already cleaned -- or when the
+    lower mode sits too close under bone to be soft tissue
+    (``_BONE_SOFT_MAX_POSITION``).
+    """
+    values = np.asarray(values)
+    if values.size == 0 or not high > low:
+        return None
+    counts, edges = np.histogram(values, bins=nbins, range=(low, high))
+    smoothed = gaussian_filter1d(counts.astype(np.float64), sigma=smooth_sigma)
+    peaks, _ = find_peaks(smoothed, prominence=max(float(smoothed.max()) * _BONE_PEAK_MIN_PROMINENCE, 1e-8))
+    if not len(peaks):
+        return None
+    bone = int(peaks[-1])
+    below = [int(p) for p in peaks if p < bone]
+    soft = max(below, key=lambda p: smoothed[p]) if below else 0
+    valley = soft + int(np.argmin(smoothed[soft:bone + 1]))
+    if valley in (soft, bone) or smoothed[valley] > _BONE_FLOOR_MAX_DIP * smoothed[soft] \
+            or soft > _BONE_SOFT_MAX_POSITION * bone:
+        return None
+    return float((edges[valley] + edges[valley + 1]) / 2.0)
+
+
+def clean_bone_mask(
+    volume: np.ndarray,
+    candidate: np.ndarray,
+    low: Optional[float] = None,
+    high: Optional[float] = None,
+) -> tuple[np.ndarray, dict]:
+    """
+    Keep only the bone: the voxels above the soft-tissue floor, in the one
+    large piece the jaw is.
+
+    ``candidate`` is everything thresholded in that is neither incisor nor
+    molar. Two kinds of it are not bone. Soft tissue round the teeth passes
+    the background threshold (see ``_BONE_PEAK_MIN_PROMINENCE``) and is cut at
+    ``find_bone_floor``. Islands -- specks of noise, and slivers left
+    stranded when the teeth were cut out -- are dropped by keeping only the
+    largest 26-connected piece. ``low`` and ``high`` bound the histogram the
+    floor is read from (by default the candidate's own range).
+
+    Returns (bone mask, {"floor", "soft_tissue", "islands", "kept"}), voxel
+    counts for the log.
+    """
+    values = volume[candidate]
+    info = {"floor": None, "soft_tissue": 0, "islands": 0, "kept": 0}
+    if values.size == 0:
+        return candidate.copy(), info
+    lo = float(values.min()) if low is None else float(low)
+    hi = float(values.max()) if high is None else float(high)
+    floor = find_bone_floor(values, lo, hi)
+    del values
+    bone = candidate & (volume > floor) if floor is not None else candidate.copy()
+    info["floor"] = floor
+    info["soft_tissue"] = int(candidate.sum()) - int(bone.sum())
+
+    labels, n = ndi.label(bone, structure=ndi.generate_binary_structure(3, 3))  # type: ignore
+    if n > 1:
+        sizes = np.bincount(labels.ravel())
+        sizes[0] = 0
+        largest = int(np.argmax(sizes))
+        info["islands"] = int(sizes.sum()) - int(sizes[largest])
+        bone = labels == largest
+    del labels
+    info["kept"] = int(bone.sum())
+    return bone, info
+
+
+def _log_bone_cleanup(info: dict, n_candidate: int) -> None:
+    logger.info(
+        "Bone cleanup: soft-tissue floor %s -> %d soft-tissue voxels and %d in islands removed; "
+        "%d of %d kept (%.1f%%)",
+        "none found" if info["floor"] is None else f"{info['floor']:.4g}",
+        info["soft_tissue"], info["islands"], info["kept"], n_candidate,
+        100.0 * info["kept"] / max(n_candidate, 1),
+    )
+
+
 def segment_molar_bone(
     preprocessed_volume: np.ndarray,
     min_enamel_seed_size: int = _MIN_ENAMEL_SEED_SIZE,
@@ -511,7 +853,10 @@ def segment_molar_bone(
        tip reaching into it does not count).
     4. Molars = components holding enamel at that threshold, regrown by a
        thin rim to recover the surface the threshold shaved off.
-    5. Bone = the rest of the foreground.
+    5. Bone = the rest of the foreground, less the soft tissue round the
+       teeth and the islands (see ``clean_bone_mask``).
+    6. Dim background resting on the crowns is trimmed off the molars and
+       assigned to neither mask (see ``_trim_attached_background``).
 
     Falls back to the erosion-based max-intensity method if no enamel is
     found or it never detaches from bone.
@@ -583,6 +928,22 @@ def segment_molar_bone(
             else:
                 molar_ids = np.unique(labels[enamel_mask])
                 molar_ids = molar_ids[molar_ids > 0]
+                # A component that bears "enamel" but is still part of the
+                # bone at the separation threshold is the bone itself, with a
+                # dense patch in it (see _FUSED_ENAMEL_MIN_SHARE): it stays
+                # bone, and its patch stops counting as enamel.
+                fused = _fused_with_bone(labels, molar_ids, anchor)
+                if fused.size:
+                    patch = enamel_mask & np.isin(labels, fused)
+                    logger.warning(
+                        "Molar separation: %d enamel voxel(s) (%.1f%% of the enamel) "
+                        "stay part of the bone at threshold %.4f; kept as dense "
+                        "bone, not tooth", int(patch.sum()),
+                        100.0 * float(patch.sum()) / max(int(enamel_mask.sum()), 1),
+                        threshold,
+                    )
+                    enamel_mask = enamel_mask & ~patch
+                    molar_ids = np.setdiff1d(molar_ids, fused)
                 sizes = np.bincount(labels.ravel())[molar_ids]
                 molar_ids = molar_ids[sizes >= MIN_COMPONENT_SIZE]
                 core = np.isin(labels, molar_ids)
@@ -596,9 +957,21 @@ def segment_molar_bone(
                     int(core.sum()), int(molar.sum()),
                 )
 
+                # Bone is cut against the untrimmed molars: the background
+                # trimmed off a crown is not bone, so it belongs to neither.
+                # Nor are the soft tissue round the teeth and the islands.
+                candidate = foreground & ~molar
+                bone, bone_info = clean_bone_mask(volume, candidate, low=floor, high=enamel_threshold)
+                _log_bone_cleanup(bone_info, int(candidate.sum()))
+                del candidate
+                bone_mask = np.zeros_like(foreground_full)
+                bone_mask[crop] = bone
+                del bone
+                molar = _trim_attached_background(
+                    volume, molar, enamel_mask, low=threshold, high=enamel_threshold,
+                )
                 molar_mask = np.zeros_like(foreground_full)
                 molar_mask[crop] = molar
-                bone_mask = foreground_full & ~molar_mask
 
                 if debug:
                     create_3d_visualization(
@@ -614,7 +987,13 @@ def segment_molar_bone(
     logger.warning(
         "No usable enamel separation — falling back to erosion-based component selection"
     )
-    return _segment_molar_bone_by_erosion(preprocessed_volume, foreground_full)
+    bone_mask, molar_mask = _segment_molar_bone_by_erosion(preprocessed_volume, foreground_full)
+    if bone_mask.any():
+        candidate = bone_mask
+        bone_mask, bone_info = clean_bone_mask(preprocessed_volume, candidate)
+        _log_bone_cleanup(bone_info, int(candidate.sum()))
+        del candidate
+    return bone_mask, molar_mask
 
 
 def _segment_molar_bone_by_erosion(

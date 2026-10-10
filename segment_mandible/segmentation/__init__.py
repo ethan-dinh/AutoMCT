@@ -1,4 +1,4 @@
-from .incisor import segment_incisor, shrink_incisor_margin
+from .incisor import incisor_basin, segment_incisor, shrink_incisor_margin
 from .incisor_threshold import (
     find_incisor_seed,
     polish_incisor_mask,
@@ -23,6 +23,7 @@ from .utils import (
 )
 
 __all__ = [
+    "incisor_basin",
     "segment_incisor",
     "shrink_incisor_margin",
     "segment_incisor_by_threshold_descent",

@@ -211,7 +211,7 @@ should have.
 | **Reorientation** | Axis 0 really is the longest; cross-section is X ≥ Y; a tip-driven transform was actually recorded |
 | **Incisor isolation** | Bone removal retained a sensible share of the CLAHE volume — not everything (no isolation happened), not nothing (the incisor went with the bone) |
 | **Incisor seed** | A seed was found at all; it is small enough to be a tooth cross-section rather than a slab of bone; it sits near the posterior end |
-| **Incisor mask** | Share of foreground; single connected component; slice coverage along the jaw; no interior gaps; elongation; slice-to-slice area stability; centroid trajectory smoothness; brighter than surrounding bone; physical volume in mm³ |
+| **Incisor mask** | Share of foreground; single connected component; slice coverage along the jaw; no interior gaps; elongation; slice-to-slice area stability; centroid trajectory smoothness; no cross-section spikes (slices standing ≥ 1.3× above the running median over 1.5 mm of jaw, for ≥ 0.04 mm; fails at 1.5×, and names the slices); brighter than surrounding bone; physical volume in mm³ |
 | **Margin shrink** | Enough of the mask survived; the shrink did not pinch the tooth apart |
 
 Each result is `PASS`, `WARN` or `FAIL`. A **warning** means unusual, worth an
@@ -365,6 +365,18 @@ Input volume (BMP stack / DICOM series / NRRD / TIFF)
     │    • Area-doubling guard: iterative erosion (up to 5×) to
     │      split fused structures, then re-select by centroid.
     │  Returns a boolean 3D mask.
+    │  Spike re-track (pipeline.py): a leak onto bone shows as a run
+    │  of slices standing above the cross-section's running median
+    │  (find_area_spikes). Only then, the tracker runs again with a
+    │  veto: a slice may only add voxels it did not hold on the
+    │  slice before if they lie in the incisor's watershed basin
+    │  (incisor_basin: flood of the inverted intensity from the
+    │  threshold-descent core against the bone above its threshold,
+    │  which parts them along the periodontal ligament). Needed once
+    │  the bone is as dense as the dentin (P42: 66% of the bone
+    │  within 0.2 mm is brighter than the dentin's median; P22: 3%),
+    │  where the per-slice threshold merges them and the erosion
+    │  guard accepts a one-voxel chip as a "split".
     │
     ▼
 [10] Incisor removal                  pipeline.py
@@ -388,10 +400,36 @@ Input volume (BMP stack / DICOM series / NRRD / TIFF)
     │    • Coarse sweep up from the foreground floor (10% steps)
     │      until enamel detaches from the anchor, then bisect the
     │      bracket (0.5% tolerance). ~12 labellings in total.
+    │      Components still holding the anchor count as molars
+    │      fused to bone only if they carry ≥ 3% of the enamel; less
+    │      is a dense patch of bone over the enamel threshold, kept
+    │      as bone (P42: 0.8% of the enamel held the search up to
+    │      0.551 and left the molars as enamel caps; M3 carries
+    │      11-16% on the P22 scans).
     │    • Molars = enamel-bearing components at that threshold,
     │      regrown by a 2-voxel rim (marker watershed) to recover
     │      the surface the threshold shaved off.
-    │    • Rest of the foreground → bone.
+    │    • Rest of the foreground → bone, cleaned (clean_bone_mask):
+    │      – Soft tissue out: the background threshold lets in the
+    │        soft tissue round the teeth (the incisor's pulp, the
+    │        periodontal space, gingiva on the crowns), at under
+    │        half bone's density. Cut at the valley between its mode
+    │        and bone's in the bone histogram (P22 scans: 30-43% of
+    │        the old mask); none found, none cut.
+    │      – Islands out: only the largest 26-connected piece, the
+    │        jaw, is kept.
+    │    • Background trim: the separation threshold sits below the
+    │      bone floor, so a faint skin and dim soft tissue on the
+    │      crowns come away with the molars. Tissue floor = the
+    │      molar histogram's dim/dentin valley.
+    │      – Faint skin: every voxel below halfway from the
+    │        separation threshold to the tissue floor goes.
+    │      – Crown coating: voxels below the tissue floor and > 2
+    │        voxels from brighter tooth go if their piece rests on
+    │        enamel (≤ 5 voxels) and they lie ≤ 30 voxels from it.
+    │        Pulp lining and root tips are dim too but don't touch
+    │        enamel, so they stay.
+    │      Trimmed voxels go to neither mask.
     │  Fallback (no enamel, or it never detaches) — erosion-based:
     │    • Iteratively erode foreground until ≥ 2 components appear.
     │    • Highest max-intensity component → molar; rest → bone.

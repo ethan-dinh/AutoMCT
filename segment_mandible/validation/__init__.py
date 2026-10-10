@@ -10,9 +10,11 @@ without anyone having to open that window for every sample.
 """
 
 from .checks import (
+    AreaSpike,
     CheckReport,
     CheckResult,
     Severity,
+    find_area_spikes,
     check_incisor_mask,
     check_incisor_seed,
     check_isolation_volume,
@@ -24,11 +26,13 @@ from .checks import (
 from .summary import SampleValidation, ValidationSummary
 
 __all__ = [
+    "AreaSpike",
     "CheckReport",
     "CheckResult",
     "SampleValidation",
     "Severity",
     "ValidationSummary",
+    "find_area_spikes",
     "check_incisor_mask",
     "check_incisor_seed",
     "check_isolation_volume",

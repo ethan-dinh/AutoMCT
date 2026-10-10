@@ -32,6 +32,7 @@ from validation import (  # noqa: E402
     check_preprocessed_volume,
     check_reorientation,
     check_shrink,
+    find_area_spikes,
 )
 from validation.summary import ValidationSummary  # noqa: E402
 
@@ -259,6 +260,89 @@ def test_mask_on_bone_fails_intensity_contrast():
     assert not (on_bone & incisor).any(), "the shifted mask must miss the incisor"
     report = check_incisor_mask(on_bone, volume)
     assert _severity(report, "intensity contrast") in (Severity.WARN, Severity.FAIL)
+
+
+# ---------------------------------------------------------------------------
+# Cross-section spikes -- leaks that persist or creep
+# ---------------------------------------------------------------------------
+
+def _beside_the_tube(mask, z, columns):
+    """Add ``columns`` of bone beside the tube on slice z, as a leak does."""
+    y = 18 + int(6 * z / SHAPE[0])
+    x = 30 + int(10 * z / SHAPE[0])
+    mask[z, y - 4:y + 4, x + 4:x + 4 + columns] = True
+
+
+def test_persistent_leak_is_flagged_where_it_is():
+    """
+    The P42_WT_WT_1 failure: the tracker took in a ring of bone and held it,
+    doubling the cross-section for 60 slices. Each end of the run steps only
+    2x, under the area-stability limit, so that check passed it; the spike
+    check must fail it and say which slices.
+    """
+    volume, incisor = _synthetic_mandible()
+    leaked = incisor.copy()
+    for z in range(80, 120):
+        _beside_the_tube(leaked, z, 8)          # as much bone as tooth
+    report = check_incisor_mask(leaked, volume)
+    assert _severity(report, "area stability") is Severity.PASS
+    assert _severity(report, "cross-section spikes") is Severity.FAIL
+    message = next(r.message for r in report.results if r.name == "cross-section spikes")
+    assert "80-119" in message, message
+
+
+def test_creeping_leak_is_flagged():
+    """
+    A leak that grows a little on every slice never steps at all (P42: 80
+    slices into the alveolar bone under the tooth). Against the running
+    median it still stands out.
+    """
+    volume, incisor = _synthetic_mandible()
+    crept = incisor.copy()
+    for i, z in enumerate(range(80, 125)):
+        _beside_the_tube(crept, z, 1 + i // 5)  # one more column every 5 slices
+    report = check_incisor_mask(crept, volume)
+    assert _severity(report, "area stability") is Severity.PASS
+    assert _severity(report, "cross-section spikes") in (Severity.WARN, Severity.FAIL)
+
+
+def test_good_incisor_has_no_spikes():
+    volume, incisor = _synthetic_mandible()
+    report = check_incisor_mask(incisor, volume, spacing=(0.008, 0.008, 0.008))
+    assert _severity(report, "cross-section spikes") is Severity.PASS
+
+
+def test_tapering_ends_are_not_spikes():
+    """
+    A tooth swells from its apical end and tapers to its tip. The median of a
+    monotonic run is its middle value, so neither end may read as a spike,
+    nor the shoulder where the swelling levels off.
+    """
+    counts = np.concatenate([
+        np.zeros(50),
+        np.linspace(25, 6000, 300),     # apical end filling in
+        np.full(400, 6000.0),           # the body
+        np.linspace(6000, 25, 200),     # the tip
+        np.zeros(30),
+    ])
+    assert find_area_spikes(counts, slice_mm=0.008) == []
+
+
+def test_spike_is_reported_in_volume_slices():
+    """Slice indices are the volume's, not the occupied span's."""
+    counts = np.concatenate([np.zeros(100), np.full(600, 5000.0)])
+    counts[400:460] = 10000.0
+    spikes = find_area_spikes(counts, slice_mm=0.008)
+    assert [(s.start, s.stop) for s in spikes] == [(400, 460)]
+    assert spikes[0].peak == 2.0
+    assert spikes[0].excess == 60 * 5000
+
+
+def test_short_flicker_is_not_a_spike():
+    """One or two raised slices -- the apical end's flicker -- are left alone."""
+    counts = np.full(800, 5000.0)
+    counts[300:302] = 8000.0
+    assert find_area_spikes(counts, slice_mm=0.006) == []
 
 
 # ---------------------------------------------------------------------------

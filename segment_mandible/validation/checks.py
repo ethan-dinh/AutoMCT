@@ -58,6 +58,27 @@ logger = logging.getLogger(__name__)
 # express that limit as a physical distance.
 _CENTROID_REFERENCE_PITCH_MM = 0.024
 
+# Cross-section spikes (see find_area_spikes). When the incisor's mask takes in
+# bone, the slices where it does stand out from the cross-section around them:
+# on P42_WT_WT_1 the mask doubled for 60 slices where it took in a ring of
+# alveolar bone, and the stored P22_TGM2_WT_M_5 mask rose to 2.5x for 20
+# slices where it jumped onto the dorsal ridge. The other twelve stored P22
+# masks never stay above 1.3x their running median for more than two slices
+# (their worst single slice is 1.48x, at the apical end).
+#
+# The running median spans this much of the jaw. It has to be wider than twice
+# the longest leak, or the leak becomes the median: P42's ran 0.5-0.6 mm.
+_SPIKE_WINDOW_MM = 1.5
+# A slice is raised when its cross-section is this many times the median...
+_SPIKE_RISE = 1.3
+# ...and the mask fails when a run reaches this.
+_SPIKE_FAIL_RISE = 1.5
+# A run must be at least this long to count, which leaves out the one- and
+# two-slice flickers at the apical end.
+_SPIKE_MIN_RUN_MM = 0.04
+# The slice pitch assumed when the voxel size is unknown.
+_SPIKE_DEFAULT_PITCH_MM = 0.008
+
 
 class Severity(Enum):
     """How badly a single check failed."""
@@ -188,6 +209,73 @@ def _mask_stats(mask: np.ndarray) -> dict:
         "occupied": occupied,
         "total": int(counts.sum()),
     }
+
+
+@dataclass(frozen=True)
+class AreaSpike:
+    """A run of slices whose cross-section stands above the profile round it."""
+
+    start: int      # first slice of the run
+    stop: int       # one past its last slice
+    peak: float     # largest ratio of cross-section to the running median
+    excess: int     # voxels above the running median, summed over the run
+
+    def describe(self) -> str:
+        return f"{self.start}-{self.stop - 1} ({self.peak:.1f}x)"
+
+
+def find_area_spikes(
+    counts: np.ndarray,
+    *,
+    slice_mm: float | None = None,
+    window_mm: float = _SPIKE_WINDOW_MM,
+    rise: float = _SPIKE_RISE,
+    min_run_mm: float = _SPIKE_MIN_RUN_MM,
+    min_slice_voxels: int = 20,
+) -> list[AreaSpike]:
+    """
+    Runs of slices where a mask's cross-section rises well above the
+    cross-section around it -- where it took in a neighbouring structure.
+
+    The incisor's cross-section changes slowly along its length, so each slice
+    is compared with the median of the slices around it (``window_mm`` of
+    jaw), not with the slice before it. A slice-to-slice ratio misses the two
+    ways a mask leaks: a merge that persists, which jumps once and then stays
+    level, and a merge that creeps in a few voxels per slice, which never jumps
+    at all. A median over a window more than twice as long as the leak sees
+    past both. It also follows the tooth's tapering ends without a false
+    alarm: the median of a monotonic run is its middle value.
+
+    ``counts`` is the per-slice voxel count along axis 0. Slices under
+    ``min_slice_voxels`` (the tapering tips) are left out. Returns the runs at
+    least ``min_run_mm`` long whose ratio exceeds ``rise``, in slice order.
+    """
+    counts = np.asarray(counts, dtype=float)
+    occupied = np.flatnonzero(counts >= min_slice_voxels)
+    if occupied.size < 3:
+        return []
+    first, last = int(occupied[0]), int(occupied[-1]) + 1
+    profile = counts[first:last]
+
+    pitch = slice_mm if slice_mm and slice_mm > 0 else _SPIKE_DEFAULT_PITCH_MM
+    window = max(3, int(round(window_mm / pitch)) | 1)
+    trend = ndi.median_filter(profile, size=window, mode="nearest")
+    ratio = profile / np.maximum(trend, 1.0)
+    min_run = max(2, int(np.ceil(min_run_mm / pitch)))
+
+    spikes = []
+    above = np.concatenate(([False], ratio > rise, [False]))
+    edges = np.flatnonzero(np.diff(above.astype(np.int8)))
+    for start, stop in zip(edges[::2], edges[1::2]):
+        if stop - start < min_run:
+            continue
+        spikes.append(AreaSpike(
+            start=first + int(start),
+            stop=first + int(stop),
+            peak=float(ratio[start:stop].max()),
+            excess=int(round(float((profile[start:stop] - trend[start:stop]).sum()))),
+        ))
+    return spikes
 
 
 def _largest_component_fraction(mask: np.ndarray) -> tuple[float, int]:
@@ -844,6 +932,31 @@ def check_incisor_mask(
                        if measured > limit else "")
                 ),
             )
+
+    # --- 5b. No stretch of jaw where the cross-section balloons ---
+    # The slice-to-slice ratio above sees only a step, and a leak need not be
+    # one: once the mask has taken in a ring of bone it stays level, and a
+    # creeping leak never steps at all. Comparing each slice with the median of
+    # the jaw around it catches both, and says where they are.
+    spikes = find_area_spikes(
+        counts, slice_mm=float(spacing[0]) if spacing is not None else None,
+        min_slice_voxels=min_slice_voxels,
+    )
+    worst_rise = max((s.peak for s in spikes), default=1.0)
+    report.add_if(
+        "cross-section spikes",
+        value=worst_rise,
+        fail_when=worst_rise >= _SPIKE_FAIL_RISE,
+        warn_when=bool(spikes),
+        message=(
+            "no stretch of slices stands out from the cross-section around it"
+            if not spikes else
+            f"cross-section rises above the jaw around it at slices "
+            f"{', '.join(s.describe() for s in spikes)}, "
+            f"{sum(s.excess for s in spikes):,} voxels over the running median"
+            " — the mask took in a neighbouring structure there"
+        ),
+    )
 
     # --- 6. Denser than what surrounds it ---
     # Enamel and dentine are the most mineralised tissue in the scan, so the
