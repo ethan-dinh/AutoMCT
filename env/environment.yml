@@ -14,11 +14,17 @@ dependencies:
   - tqdm
   - pillow
   - matplotlib
+  - numba
   # CLI / TUI utilities
   - rich
+  # Interactive menus in segment_mandible/tests/test_pipeline.py
+  - questionary
   # Visualization
   - napari
   - pyqt6
+  # Tk ships with conda's Python on all platforms; pinned explicitly because
+  # segment_mandible/tests/run.py imports tkinter for its native file pickers.
+  - tk
   # Build tools
   - pip
   - pip:
@@ -26,6 +32,8 @@ dependencies:
       - pynrrd
       # DICOM reading (used by tools/convert_DICOM_NRRD.py)
       - pydicom>=2.4
+      # Speeds up napari's OpenGL rendering (optional but recommended)
+      - PyOpenGL-accelerate
       # Deep learning (ML-Segmentation module)
       # For GPU support, install PyTorch separately — see env/README.md
       - torch>=2.0
