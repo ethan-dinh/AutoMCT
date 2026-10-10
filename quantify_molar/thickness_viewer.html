@@ -1,0 +1,865 @@
+<!doctype html>
+<!--
+  Template for <sample>_thickness_map.html, filled in by enamel_surfaces.write_viewer:
+  __SAMPLE__ (the name), "__META__" (JSON: layout, per-tooth numbers) and
+  __DATA__ (the meshes, gzip + base64). Self-contained: no network, no libraries.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enamel thickness: __SAMPLE__</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --stage: #0e1213; --stage-2: #161b1c; --stage-3: #1e2527; --line: #2c3436;
+    --ink: #e2e9e7; --ink-2: #a3aeac; --ink-3: #74807e; --accent: #5fb3b9; --accent-ink: #081112;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--stage); color: var(--ink);
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; outline: none; }
+  canvas.dragging { cursor: grabbing; }
+  .panel { position: absolute; background: rgba(22, 27, 28, 0.9); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  #controls { top: 12px; left: 12px; width: 312px; }
+  #legend { left: 12px; bottom: 12px; width: 312px; }
+  #teeth { top: 12px; right: 12px; min-width: 190px; }
+  body.bare .panel { display: none; }
+  #show { position: absolute; top: 12px; left: 12px; display: none; }
+  body.bare #show { display: inline-block; }
+  h1 { margin: 0; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+  .sub { color: var(--ink-3); font-size: 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; }
+  button { font: inherit; font-size: 12px; color: var(--ink); background: var(--stage-3); border: 1px solid var(--line);
+    border-radius: 6px; padding: 3px 8px; cursor: pointer; }
+  button:hover { border-color: var(--ink-3); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  button:focus-visible, input:focus-visible, canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .seg { display: inline-flex; }
+  .seg button { border-radius: 0; }
+  .seg button:first-child { border-radius: 6px 0 0 6px; }
+  .seg button:last-child { border-radius: 0 6px 6px 0; border-left: 0; }
+  label { color: var(--ink-2); font-size: 12px; display: inline-flex; gap: 5px; align-items: center; }
+  input[type=number] { width: 58px; font: inherit; font-size: 12px; color: var(--ink); background: var(--stage-3);
+    border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
+  .hint { color: var(--ink-3); font-size: 11.5px; margin-top: 8px; }
+  label.grow { flex: 1; }
+  label.grow input[type=range] { flex: 1; accent-color: var(--accent); }
+  .num { font-variant-numeric: tabular-nums; min-width: 34px; text-align: right; }
+  .title { font-size: 12px; font-weight: 600; }
+  .bar { height: 12px; border-radius: 3px; margin-top: 6px; }
+  .ticks { position: relative; height: 16px; margin-top: 2px; font-size: 11px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .ticks span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
+  .ticks span.first { transform: none; }
+  .ticks span.last { transform: translateX(-100%); }
+  .keys { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; font-size: 12px; color: var(--ink-2); }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .caption { color: var(--ink-3); font-size: 11.5px; margin-top: 6px; }
+  table { border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 12px; margin-top: 4px; }
+  th, td { padding: 2px 6px; text-align: right; white-space: nowrap; }
+  th { color: var(--ink-3); font-weight: 500; }
+  th:first-child, td:first-child { text-align: left; padding-left: 0; }
+  tr.all td { border-top: 1px solid var(--line); }
+  #tip { position: fixed; pointer-events: none; display: none; padding: 4px 8px; border-radius: 6px; background: var(--stage-3);
+    border: 1px solid var(--line); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #error { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px;
+    text-align: center; color: var(--ink-2); }
+  #error.on { display: flex; }
+  @media (max-width: 760px), (max-height: 540px) { #teeth { display: none; } }
+  @media (max-width: 480px) { #controls, #legend { width: auto; right: 12px; } .hint { display: none; } }
+</style>
+</head>
+<body>
+<canvas id="view" tabindex="0" aria-label="Enamel thickness map in 3-D. Drag to rotate, shift-drag to move, scroll to zoom, arrow keys to turn."></canvas>
+<div id="controls" class="panel">
+  <h1>__SAMPLE__</h1>
+  <div class="sub">Enamel thickness in 3-D</div>
+  <div class="row" id="modes" role="group" aria-label="Colour" hidden>
+    <span class="seg">
+      <button type="button" data-mode="thickness">Thickness</button>
+      <button type="button" data-mode="thin">Thinner than around</button>
+      <button type="button" data-mode="low_density">Less dense than around</button>
+    </span>
+  </div>
+  <div class="row">
+    <label class="grow">Enamel <input type="range" id="enamel" min="0" max="100" step="5" value="100" aria-label="Enamel opacity, percent"> <span id="enamel-val" class="num">100%</span></label>
+  </div>
+  <div class="row" role="group" aria-label="View">
+    <button type="button" data-view="side">Side</button>
+    <button type="button" data-view="top">Top</button>
+    <button type="button" data-view="other">Other side</button>
+    <button type="button" data-view="bottom">Below</button>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="dentin" checked> Dentin and roots</label>
+    <label>Scale <input type="number" id="vmin" min="0" max="2000" step="10" aria-label="Scale from"> to <input type="number" id="vmax" min="1" max="2000" step="10" aria-label="Scale to"> <span id="unit">µm</span></label>
+  </div>
+  <div class="row">
+    <button type="button" id="save">Save image</button>
+    <button type="button" id="hide">Hide panels</button>
+  </div>
+  <div class="hint">Drag to rotate · Shift- or right-drag to move · Scroll to zoom · Double-click to reset</div>
+</div>
+<button type="button" id="show">Show panels</button>
+<div id="teeth" class="panel"></div>
+<div id="legend" class="panel"></div>
+<div id="tip"></div>
+<div id="error"></div>
+<script id="meta" type="application/json">"__META__"</script>
+<script id="data" type="application/octet-stream">__DATA__</script>
+<script type="module">
+const meta = JSON.parse(document.getElementById("meta").textContent);
+
+// Sequential blue, dark to light: on the dark stage, thicker enamel is brighter.
+const RAMP = ["#184f95", "#1c5cab", "#256abf", "#2a78d6", "#3987e5", "#5598e7", "#6da7ec", "#86b6ef", "#9ec5f4", "#b7d3f6", "#cde2fb"];
+const NO_DATA = "#8a8378", CONTEXT = "#4b5557", STAGE = "#0e1213";
+// Sequential orange, dark to light (OKLCH L 0.36-0.91 around the palette's orange): the more the enamel falls
+// short of the enamel around it, the brighter. Patches show at full colour, the rest of the judged enamel muted.
+const SHORT_RAMP = ["#5c2e24", "#7c311e", "#9b3513", "#b73c04", "#ce4a06", "#e05e21", "#ed7740", "#f39264", "#f5ad8a", "#fac5ab", "#ffd8bb"];
+const P = meta.patches || {};
+const pct = (v) => (v == null ? null : 100 * v);
+const MODES = {
+  thickness: { title: "Enamel thickness (µm)", unit: "µm", ramp: RAMP, step: 0, vmin: meta.vmin || 0, vmax: meta.vmax || 120,
+    inputStep: 10, inputMax: 2000 },
+  thin: { title: "Thinner than the enamel around it (%)", unit: "%", ramp: SHORT_RAMP, step: 5, vmin: 0, vmax: 80,
+    inputStep: 5, inputMax: 100, by: pct(P.thin?.by) },
+  low_density: { title: "Less mineral than the enamel around it (%)", unit: "%", ramp: SHORT_RAMP, step: 1, vmin: 0, vmax: 20,
+    inputStep: 1, inputMax: 100, by: pct(P.low_density?.by) },
+};
+const MODE_CAPTION = {
+  thin: (by) => `Colour: how much thinner the enamel is than the enamel within about ${P.around_um ? Math.round(P.around_um * 2) : 120} µm around it on the same tooth. Full colour: counted patches (at least ${by ?? 45}% thinner over at least the smallest patch). Muted: the rest of the judged enamel. Grey: not judged — near the enamel's edge (the cervical margin or a bare cusp), at a contact, or not measured.`,
+  low_density: (by) => `Colour: how much less mineral the enamel's core holds than the enamel within about ${P.around_um ? Math.round(P.around_um * 2) : 120} µm around it (its density above the background), read clear of its blurred faces. Full colour: counted patches (at least ${by ?? 12}% less). Muted: the rest of the judged enamel. Grey: not judged — too thin for a core, near the enamel's edge or at a contact.`,
+};
+const FOV = 30 * Math.PI / 180, PITCH_MAX = 1.5607;
+const VIEWS = { side: [0, 0.15], top: [0, PITCH_MAX], other: [Math.PI, 0.15], bottom: [0, -PITCH_MAX] };
+const CAPTION = "Colour: the enamel's thickness where it is measured, along lines through the enamel between its outer surface and the enamel–dentin junction.";
+const CAPTION_LIFTED = " With the enamel faded, the dentin's crown shows the thickness of the enamel above each point.";
+
+const $ = (id) => document.getElementById(id);
+const canvas = $("view"), tip = $("tip");
+const hex = (s) => [1, 3, 5].map((i) => parseInt(s.slice(i, i + 2), 16) / 255);
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const fmt = (v, d = 0) => (v == null || !Number.isFinite(v) ? "–" : v.toFixed(d));
+const el = (tag, attrs = {}, ...kids) => {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "style") Object.assign(node.style, v); else if (k === "class") node.className = v; else node.setAttribute(k, v);
+  }
+  node.append(...kids.filter((k) => k != null));
+  return node;
+};
+
+function fail(message) {
+  const box = $("error");
+  box.textContent = message;
+  box.classList.add("on");
+  document.querySelectorAll(".panel").forEach((p) => { p.style.display = "none"; });
+}
+
+// ------------------------------------------------------------------ data
+async function unpack() {
+  if (!("DecompressionStream" in window)) {
+    throw new Error("this browser cannot unpack it. Open the file in a current Chrome, Edge, Firefox or Safari.");
+  }
+  const b64 = $("data").textContent.trim();
+  let bytes;
+  if (typeof Uint8Array.fromBase64 === "function") {
+    bytes = Uint8Array.fromBase64(b64);
+  } else {
+    const bin = atob(b64);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Response(stream).arrayBuffer();
+}
+
+function normals(pos, index) {
+  const nrm = new Float32Array(pos.length);
+  for (let f = 0; f < index.length; f += 3) {
+    const a = index[f] * 3, b = index[f + 1] * 3, c = index[f + 2] * 3;
+    const ux = pos[b] - pos[a], uy = pos[b + 1] - pos[a + 1], uz = pos[b + 2] - pos[a + 2];
+    const vx = pos[c] - pos[a], vy = pos[c + 1] - pos[a + 1], vz = pos[c + 2] - pos[a + 2];
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    for (const k of [a, b, c]) { nrm[k] += nx; nrm[k + 1] += ny; nrm[k + 2] += nz; }
+  }
+  for (let i = 0; i < nrm.length; i += 3) {
+    const l = Math.hypot(nrm[i], nrm[i + 1], nrm[i + 2]) || 1;
+    nrm[i] /= l; nrm[i + 1] /= l; nrm[i + 2] /= l;
+  }
+  return nrm;
+}
+
+function decode(buf, spec) {
+  const { bbox_min: lo, scale } = meta.layout;
+  const n = spec.n_vertices;
+  const q = new Uint16Array(buf, spec.pos, n * 3);
+  const pos = new Float32Array(n * 3);
+  for (let i = 0; i < n * 3; i++) pos[i] = lo[i % 3] + q[i] * scale[i % 3];
+  const index = new Uint32Array(buf, spec.faces, spec.n_faces * 3);
+  const layer = { pos, index, normal: normals(pos, index), count: spec.n_faces * 3, n, hasValues: spec.value != null };
+  if (layer.hasValues) {
+    // Thickness times "measured", and "measured": their ratio, interpolated across a
+    // triangle, averages only the measured corners.
+    const v = new Uint16Array(buf, spec.value, n);
+    layer.valueHas = new Float32Array(n);
+    layer.has = new Float32Array(n);
+    for (let i = 0; i < n; i++) if (v[i] !== 65535) { layer.has[i] = 1; layer.valueHas[i] = v[i] / 10; }
+  }
+  layer.tooth = spec.tooth != null ? Float32Array.from(new Uint8Array(buf, spec.tooth, n)) : new Float32Array(n);
+  // Each mode's (value times "judged", "judged", "in a counted patch"); thickness from above.
+  layer.modes = {};
+  if (layer.hasValues) layer.modes.thickness = { valueHas: layer.valueHas, has: layer.has, patch: new Float32Array(n) };
+  for (const kind of ["thin", "low_density"]) {
+    if (spec[kind] == null) continue;
+    const d = new Int16Array(buf, spec[kind], n), f = new Uint8Array(buf, spec[`${kind}_patch`], n);
+    const m = { valueHas: new Float32Array(n), has: new Float32Array(n), patch: new Float32Array(n) };
+    for (let i = 0; i < n; i++) if (d[i] !== -32768) { m.has[i] = 1; m.valueHas[i] = d[i] / 10; m.patch[i] = f[i]; }
+    layer.modes[kind] = m;
+  }
+  return layer;
+}
+
+// ------------------------------------------------------------------ WebGL
+const gl = canvas.getContext("webgl2", { antialias: true, preserveDrawingBuffer: true, alpha: false });
+
+const VERTEX = `#version 300 es
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNormal;
+layout(location = 2) in float aValueHas;
+layout(location = 3) in float aHas;
+layout(location = 4) in float aTooth;
+layout(location = 5) in float aPatch;
+uniform mat4 uProj, uView;
+out vec3 vNormal;
+out vec3 vViewPos;
+out float vValueHas;
+out float vHas;
+out float vPatch;
+flat out float vTooth;
+void main() {
+  vec4 p = uView * vec4(aPos, 1.0);
+  vViewPos = p.xyz;
+  vNormal = mat3(uView) * aNormal;
+  vValueHas = aValueHas;
+  vHas = aHas;
+  vPatch = aPatch;
+  vTooth = aTooth;
+  gl_Position = uProj * p;
+}`;
+
+const SHADE = `#version 300 es
+precision highp float;
+in vec3 vNormal;
+in vec3 vViewPos;
+in float vValueHas;
+in float vHas;
+in float vPatch;
+uniform sampler2D uRamp;
+uniform float uVmin, uVmax, uSteps;
+uniform int uMode, uMute;
+uniform vec3 uNoData, uContext;
+uniform float uAlpha;
+out vec4 outColor;
+void main() {
+  vec3 n = normalize(vNormal);
+  vec3 v = normalize(-vViewPos);
+  if (dot(n, v) < 0.0) n = -n;
+  vec3 base;
+  if (vHas < 0.5) base = uMode == 1 ? uContext : uNoData;
+  else {
+    float t = clamp((vValueHas / max(vHas, 1e-4) - uVmin) / max(uVmax - uVmin, 1e-3), 0.0, 1.0);
+    // Stepped: each band one colour, from the ramp's first to its last.
+    if (uSteps > 0.5) t = min(floor(t * uSteps), uSteps - 1.0) / max(uSteps - 1.0, 1.0);
+    base = texture(uRamp, vec2((t * 255.0 + 0.5) / 256.0, 0.5)).rgb;
+    // Outside a counted patch: the same band, greyed and dimmed, so the patches stand out.
+    if (uMute == 1 && vPatch / max(vHas, 1e-4) < 0.5) base = mix(vec3(dot(base, vec3(0.30, 0.59, 0.11))), base, 0.3) * 0.7;
+  }
+  vec3 key = normalize(vec3(-0.45, 0.65, 0.6));
+  float diffuse = 0.62 * max(dot(n, v), 0.0) + 0.24 * max(dot(n, key), 0.0);
+  float spec = 0.08 * pow(max(dot(reflect(-key, n), v), 0.0), 28.0);
+  outColor = vec4(base * (0.30 + diffuse) + spec, uAlpha);
+}`;
+
+// Picking: thickness in tenths of a micrometre over red and green, the tooth in
+// blue, and what was hit in alpha: 255 enamel, 254 unmeasured enamel, 252
+// dentin under measured enamel, 253 dentin or root with no enamel.
+const PICK = `#version 300 es
+precision highp float;
+in float vValueHas;
+in float vHas;
+in float vPatch;
+flat in float vTooth;
+uniform int uMode;
+uniform float uOffset;
+out vec4 outColor;
+void main() {
+  float tooth = vTooth / 255.0;
+  if (vHas < 0.5) { outColor = vec4(0.0, 0.0, tooth, (uMode == 1 ? 253.0 : 254.0) / 255.0); return; }
+  float t = clamp(floor(vValueHas / max(vHas, 1e-4) * 10.0 + 0.5) + uOffset, 0.0, 65534.0);
+  float hi = floor(t / 256.0);
+  bool inPatch = vPatch / max(vHas, 1e-4) >= 0.5;
+  float a = uMode == 1 ? (inPatch ? 250.0 : 252.0) : (inPatch ? 251.0 : 255.0);
+  outColor = vec4(hi / 255.0, (t - hi * 256.0) / 255.0, tooth, a / 255.0);
+}`;
+
+function program(fragment) {
+  const make = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, make(gl.VERTEX_SHADER, VERTEX));
+  gl.attachShader(p, make(gl.FRAGMENT_SHADER, fragment));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const loc = {};
+  for (const name of ["uProj", "uView", "uRamp", "uVmin", "uVmax", "uSteps", "uMode", "uMute", "uOffset", "uNoData", "uContext", "uAlpha"]) loc[name] = gl.getUniformLocation(p, name);
+  return { p, loc };
+}
+
+function upload(layer) {
+  const buffer = (data) => {
+    const b = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    return b;
+  };
+  const shared = { pos: buffer(layer.pos), normal: buffer(layer.normal), tooth: buffer(layer.tooth) };
+  const index = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, index);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, layer.index, gl.STATIC_DRAW);
+  const attribute = (loc, b, size) => {
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+  };
+  const vao = (values) => {
+    const v = gl.createVertexArray();
+    gl.bindVertexArray(v);
+    attribute(0, shared.pos, 3);
+    attribute(1, shared.normal, 3);
+    attribute(4, shared.tooth, 1);
+    if (values) { attribute(2, buffer(values.valueHas), 1); attribute(3, buffer(values.has), 1); attribute(5, buffer(values.patch), 1); }
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, index);
+    gl.bindVertexArray(null);
+    return v;
+  };
+  layer.vaos = {};
+  for (const [mode, values] of Object.entries(layer.modes)) layer.vaos[mode] = vao(values);
+  layer.vaos.none = vao(null);
+}
+
+function rampTexture(colours = RAMP) {
+  const stops = colours.map(hex), px = new Uint8Array(256 * 4);
+  for (let i = 0; i < 256; i++) {
+    const t = (i / 255) * (stops.length - 1), k = Math.min(Math.floor(t), stops.length - 2), f = t - k;
+    for (let c = 0; c < 3; c++) px[i * 4 + c] = Math.round(255 * (stops[k][c] * (1 - f) + stops[k + 1][c] * f));
+    px[i * 4 + 3] = 255;
+  }
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
+}
+
+// ------------------------------------------------------------------ camera
+const cam = { yaw: 0, pitch: VIEWS.side[1], dist: 1, target: [0, 0, 0] };
+let centre = [0, 0, 0], radius = 1;
+
+function eyePos() {
+  const cp = Math.cos(cam.pitch);
+  return [cam.target[0] + cam.dist * cp * Math.sin(cam.yaw), cam.target[1] + cam.dist * Math.sin(cam.pitch),
+    cam.target[2] + cam.dist * cp * Math.cos(cam.yaw)];
+}
+
+function lookAt(eye, at) {
+  let zx = eye[0] - at[0], zy = eye[1] - at[1], zz = eye[2] - at[2];
+  let l = Math.hypot(zx, zy, zz) || 1;
+  zx /= l; zy /= l; zz /= l;
+  let xx = zz, xz = -zx;                              // (0, 1, 0) x z
+  l = Math.hypot(xx, xz) || 1;
+  xx /= l; xz /= l;
+  const yx = zy * xz, yy = zz * xx - zx * xz, yz = -zy * xx;  // z x x
+  return {
+    m: new Float32Array([xx, yx, zx, 0, 0, yy, zy, 0, xz, yz, zz, 0,
+      -(xx * eye[0] + xz * eye[2]), -(yx * eye[0] + yy * eye[1] + yz * eye[2]), -(zx * eye[0] + zy * eye[1] + zz * eye[2]), 1]),
+    right: [xx, 0, xz], up: [yx, yy, yz],
+  };
+}
+
+function perspective(aspect, near, far) {
+  const f = 1 / Math.tan(FOV / 2), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+
+function setView(name) {
+  [cam.yaw, cam.pitch] = VIEWS[name];
+  cam.target = [...centre];
+  cam.dist = radius / Math.sin(FOV / 2) * 1.08;
+  requestRender();
+}
+
+// ------------------------------------------------------------------ drawing
+const layers = {};
+let shade, pick, ramps = {}, pickTarget = null;
+let enamelAlpha = 1, showDentin = true, mode = "thickness";
+let vmin = MODES.thickness.vmin, vmax = MODES.thickness.vmax;
+const steps = () => (MODES[mode].step ? Math.max(1, Math.round((vmax - vmin) / MODES[mode].step)) : 0);
+
+// [layer, part (0 enamel, 1 dentin), opacity]: the dentin first, so a faded enamel blends over it.
+function visible(forPicking = false) {
+  const out = [];
+  if (showDentin && layers.dentin) out.push([layers.dentin, 1, 1]);
+  if (layers.enamel && enamelAlpha > (forPicking ? 0.5 : 0)) out.push([layers.enamel, 0, enamelAlpha]);
+  return out;
+}
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.round(canvas.clientWidth * dpr)), h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+}
+
+function pickBuffer() {
+  const w = canvas.width, h = canvas.height;
+  if (pickTarget && pickTarget.w === w && pickTarget.h === h) return pickTarget.fbo;
+  if (pickTarget) { gl.deleteFramebuffer(pickTarget.fbo); gl.deleteRenderbuffer(pickTarget.color); gl.deleteRenderbuffer(pickTarget.depth); }
+  const color = gl.createRenderbuffer();
+  gl.bindRenderbuffer(gl.RENDERBUFFER, color);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA8, w, h);
+  const depth = gl.createRenderbuffer();
+  gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, color);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+  pickTarget = { fbo, color, depth, w, h };
+  return fbo;
+}
+
+function draw(pixel = null) {
+  if (!shade || !pick) return null;      // asked for before the data is up (a resize at load)
+  resize();
+  const w = canvas.width, h = canvas.height, prog = pixel ? pick : shade;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, pixel ? pickBuffer() : null);
+  gl.viewport(0, 0, w, h);
+  if (pixel) {
+    gl.enable(gl.SCISSOR_TEST);
+    gl.scissor(pixel[0], pixel[1], 1, 1);
+    gl.clearColor(0, 0, 0, 0);
+  } else {
+    const s = hex(STAGE);
+    gl.clearColor(s[0], s[1], s[2], 1);
+  }
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.BLEND);
+  gl.useProgram(prog.p);
+  const view = lookAt(eyePos(), cam.target);
+  const near = Math.max(cam.dist - radius * 1.6, cam.dist * 0.01), far = cam.dist + radius * 2;
+  gl.uniformMatrix4fv(prog.loc.uProj, false, perspective(w / h, near, far));
+  gl.uniformMatrix4fv(prog.loc.uView, false, view.m);
+  if (!pixel) {
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, ramps[mode]);
+    gl.uniform1i(prog.loc.uRamp, 0);
+    gl.uniform1f(prog.loc.uVmin, vmin);
+    gl.uniform1f(prog.loc.uVmax, vmax);
+    gl.uniform1f(prog.loc.uSteps, steps());
+    gl.uniform1i(prog.loc.uMute, mode === "thickness" ? 0 : 1);
+    gl.uniform3fv(prog.loc.uNoData, hex(NO_DATA));
+    gl.uniform3fv(prog.loc.uContext, hex(CONTEXT));
+  } else {
+    // Deficits can be negative (thicker than around): read back shifted up.
+    gl.uniform1f(prog.loc.uOffset, mode === "thickness" ? 0 : 32768);
+  }
+  for (const [layer, part, alpha] of visible(!!pixel)) {
+    const faded = !pixel && alpha < 0.999;
+    gl.uniform1i(prog.loc.uMode, part);
+    if (!pixel) gl.uniform1f(prog.loc.uAlpha, alpha);
+    if (faded) {
+      // A see-through enamel: its outer face only (back faces culled), over what is already drawn.
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.enable(gl.CULL_FACE);
+      gl.cullFace(gl.BACK);
+      gl.depthMask(false);
+    }
+    const vao = layer.vaos[mode];
+    gl.bindVertexArray(vao || layer.vaos.none);
+    if (!vao) { gl.vertexAttrib1f(2, 0); gl.vertexAttrib1f(3, 0); gl.vertexAttrib1f(5, 0); }
+    gl.drawElements(gl.TRIANGLES, layer.count, gl.UNSIGNED_INT, 0);
+    if (faded) { gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE); gl.depthMask(true); }
+  }
+  gl.bindVertexArray(null);
+  if (pixel) {
+    const out = new Uint8Array(4);
+    gl.readPixels(pixel[0], pixel[1], 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, out);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return out;
+  }
+  return null;
+}
+
+let queued = false;
+function requestRender() {
+  if (queued) return;
+  queued = true;
+  requestAnimationFrame(() => { queued = false; draw(); });
+}
+
+// ------------------------------------------------------------------ hover
+function readout(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.floor((clientX - rect.left) * canvas.width / rect.width);
+  const y = Math.floor((rect.bottom - clientY) * canvas.height / rect.height);
+  if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return null;
+  const px = draw([x, y]);
+  if (!px) return null;
+  const [r, g, b, a] = px;
+  const tooth = meta.teeth[String(b)] || "";
+  const at = tooth ? ` · ${tooth}` : "";
+  if (mode !== "thickness") {
+    const v = (r * 256 + g - 32768) / 10, patch = a === 251 || a === 250 ? " · in a patch" : "";
+    const what = mode === "thin" ? ["thinner", "thicker"] : ["less mineral", "more mineral"];
+    const said = `${Math.abs(v).toFixed(1)}% ${v >= 0 ? what[0] : what[1]} than the enamel around it`;
+    if (a === 255 || a === 251) return `${said}${patch}${at}`;
+    if (a === 252 || a === 250) return `Enamel above: ${said}${patch}${at}`;
+    if (a === 254) return `Not judged here: ${mode === "thin" ? "near the enamel's edge, a contact, or not measured" : "too thin for a core, near the enamel's edge, or a contact"}${at}`;
+    if (a === 253) return `${tooth ? `${tooth} · ` : ""}dentin or root, no enamel judged above`;
+    return null;
+  }
+  const um = ((r * 256 + g) / 10).toFixed(1);
+  if (a === 255 || a === 251) return `Enamel ${um} µm thick${at}`;
+  if (a === 254) return `Enamel, not measured here${at}`;
+  if (a === 252 || a === 250) return `${um} µm of enamel above${at}`;
+  if (a === 253) return `${tooth ? `${tooth} · ` : ""}dentin or root, no enamel`;
+  return null;
+}
+
+function hideTip() { tip.style.display = "none"; }
+
+let hoverAt = null, hoverQueued = false;
+function scheduleHover(e) {
+  hoverAt = [e.clientX, e.clientY];
+  if (hoverQueued) return;
+  hoverQueued = true;
+  requestAnimationFrame(() => {
+    hoverQueued = false;
+    const text = readout(...hoverAt);
+    if (!text) { hideTip(); return; }
+    tip.textContent = text;
+    tip.style.display = "block";
+    const w = tip.offsetWidth, h = tip.offsetHeight;
+    tip.style.left = `${Math.min(hoverAt[0] + 14, window.innerWidth - w - 6)}px`;
+    tip.style.top = `${Math.min(hoverAt[1] + 16, window.innerHeight - h - 6)}px`;
+  });
+}
+
+// ------------------------------------------------------------------ controls
+const pointers = new Map();
+let dragMode = null, pinch = null;
+
+function pan(dx, dy) {
+  const view = lookAt(eyePos(), cam.target);
+  const s = 2 * cam.dist * Math.tan(FOV / 2) / Math.max(canvas.clientHeight, 1);
+  for (let i = 0; i < 3; i++) cam.target[i] += (-dx * view.right[i] + dy * view.up[i]) * s;
+}
+
+function zoom(factor) { cam.dist = clamp(cam.dist * factor, radius * 0.05, radius * 30); }
+
+function pinchState() {
+  const [a, b] = [...pointers.values()];
+  return { d: Math.hypot(a[0] - b[0], a[1] - b[1]) || 1, m: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2] };
+}
+
+canvas.addEventListener("pointerdown", (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  canvas.focus({ preventScroll: true });
+  pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  dragMode = e.button === 1 || e.button === 2 || e.shiftKey ? "pan" : "rotate";
+  pinch = pointers.size === 2 ? pinchState() : null;
+  canvas.classList.add("dragging");
+  hideTip();
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (!pointers.has(e.pointerId)) { scheduleHover(e); return; }
+  const prev = pointers.get(e.pointerId);
+  pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  if (pointers.size === 2 && pinch) {
+    const now = pinchState();
+    zoom(pinch.d / now.d);
+    pan(now.m[0] - pinch.m[0], now.m[1] - pinch.m[1]);
+    pinch = now;
+  } else {
+    const dx = e.clientX - prev[0], dy = e.clientY - prev[1];
+    if (dragMode === "pan") pan(dx, dy);
+    else { cam.yaw -= dx * 0.008; cam.pitch = clamp(cam.pitch + dy * 0.008, -PITCH_MAX, PITCH_MAX); }
+  }
+  requestRender();
+});
+const release = (e) => {
+  pointers.delete(e.pointerId);
+  pinch = pointers.size === 2 ? pinchState() : null;
+  if (!pointers.size) { dragMode = null; canvas.classList.remove("dragging"); }
+};
+canvas.addEventListener("pointerup", release);
+canvas.addEventListener("pointercancel", release);
+canvas.addEventListener("pointerleave", hideTip);
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+canvas.addEventListener("dblclick", () => setView("side"));
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+  zoom(Math.exp(dy * 0.0015));
+  hideTip();
+  requestRender();
+}, { passive: false });
+canvas.addEventListener("keydown", (e) => {
+  const turn = 0.12;
+  if (e.key === "ArrowLeft") cam.yaw += turn;
+  else if (e.key === "ArrowRight") cam.yaw -= turn;
+  else if (e.key === "ArrowUp") cam.pitch = clamp(cam.pitch - turn, -PITCH_MAX, PITCH_MAX);
+  else if (e.key === "ArrowDown") cam.pitch = clamp(cam.pitch + turn, -PITCH_MAX, PITCH_MAX);
+  else if (e.key === "+" || e.key === "=") zoom(0.87);
+  else if (e.key === "-" || e.key === "_") zoom(1.15);
+  else if (e.key === "r" || e.key === "R") { setView("side"); return; }
+  else return;
+  e.preventDefault();
+  requestRender();
+});
+new ResizeObserver(() => requestRender()).observe(canvas);
+
+// ------------------------------------------------------------------ panels
+function niceStep(span) {
+  const raw = span / 6, p = 10 ** Math.floor(Math.log10(raw)), m = raw / p;
+  return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
+}
+
+// [position 0-1 along the bar, label]
+function ticks() {
+  const span = vmax - vmin, step = niceStep(span), out = [[0, vmin > 0 ? `≤ ${+vmin.toFixed(3)}` : "0"]];
+  for (let v = Math.ceil((vmin + step * 0.6) / step) * step; v < vmax - step * 0.6; v += step) out.push([(v - vmin) / span, `${+v.toFixed(3)}`]);
+  out.push([1, `≥ ${+vmax.toFixed(3)}`]);
+  return out;
+}
+
+// The colour bar: smooth, or one flat band per step.
+function rampCss() {
+  const colours = MODES[mode].ramp, n = steps();
+  if (!n) return `linear-gradient(to right, ${colours.join(", ")})`;
+  const at = (t) => colours[Math.round(t * (colours.length - 1))];
+  const parts = [];
+  for (let k = 0; k < n; k++) {
+    const c = at(n > 1 ? k / (n - 1) : 0);
+    parts.push(`${c} ${(100 * k) / n}%`, `${c} ${(100 * (k + 1)) / n}%`);
+  }
+  return `linear-gradient(to right, ${parts.join(", ")})`;
+}
+
+function muted(c) {
+  const [r, g, b] = hex(c), y = 0.3 * r + 0.59 * g + 0.11 * b;
+  return `rgb(${[r, g, b].map((v) => Math.round(255 * 0.7 * (y + 0.3 * (v - y)))).join(", ")})`;
+}
+
+function renderLegend() {
+  const marks = ticks(), m = MODES[mode], deficit = mode !== "thickness";
+  const bright = m.ramp[Math.round(0.75 * (m.ramp.length - 1))];
+  $("legend").replaceChildren(
+    el("div", { class: "title" }, m.title),
+    el("div", { class: "bar", style: { background: rampCss() } }),
+    el("div", { class: "ticks" }, ...marks.map(([at, label], i) => el("span", {
+      class: i === 0 ? "first" : i === marks.length - 1 ? "last" : "", style: { left: `${at * 100}%` },
+    }, label))),
+    el("div", { class: "keys" },
+      deficit ? el("span", {}, el("span", { class: "sw", style: { background: bright } }), "Counted patch") : null,
+      deficit ? el("span", {}, el("span", { class: "sw", style: { background: `linear-gradient(to right, ${muted(m.ramp[1])}, ${muted(m.ramp[6])})` } }), "Judged, not a patch") : null,
+      el("span", {}, el("span", { class: "sw", style: { background: NO_DATA } }), deficit ? "Not judged" : "Enamel, not measured"),
+      layers.dentin ? el("span", {}, el("span", { class: "sw", style: { background: CONTEXT } }), "Dentin and roots") : null),
+    el("div", { class: "caption" }, (deficit ? MODE_CAPTION[mode](m.by) : CAPTION) + (enamelAlpha < 0.999 ? CAPTION_LIFTED : "")));
+}
+
+function renderPatches() {
+  const block = P[mode] || {}, rows = block.teeth || [];
+  const share = (v) => (v == null ? "–" : `${(100 * v).toFixed(2)}%`);
+  const depth = (v) => (v == null ? "–" : `${(100 * v).toFixed(0)}%`);
+  $("teeth").replaceChildren(...[
+    el("div", { class: "title" }, mode === "thin" ? "Thin patches" : "Less dense patches"),
+    el("div", { class: "sub" }, `share of the judged enamel–dentin junction; patches at least ${MODES[mode].by ?? "–"}% ${mode === "thin" ? "thinner" : "less mineral"}`),
+    el("table", {},
+      el("thead", {}, el("tr", {}, el("th", {}, "Tooth"), el("th", {}, "Patches"), el("th", {}, "Count"),
+        el("th", { title: "Mean depth of the patches" }, "Depth"), el("th", { title: "Share of the junction judged" }, "Judged"))),
+      el("tbody", {},
+        ...rows.map((t) => el("tr", {}, el("td", {}, t.name), el("td", {}, share(t.share)), el("td", {}, t.patches ?? "–"),
+          el("td", {}, depth(t.depth)), el("td", {}, depth(t.share_judged)))),
+        el("tr", { class: rows.length ? "all" : "" }, el("td", {}, "All"), el("td", {}, share(block.share)),
+          el("td", {}, block.patches ?? "–"), el("td", {}, depth(block.depth)), el("td", {}, depth(block.share_judged))))),
+  ]);
+}
+
+function renderTeeth() {
+  if (mode !== "thickness") { renderPatches(); return; }
+  const rows = (meta.per_tooth || []).filter((t) => t.median != null);
+  const r = meta.reported || {};
+  const range = (t) => (t.p25 == null ? "–" : `${fmt(t.p25)}–${fmt(t.p75)}`);
+  const area = (v) => (v == null ? "–" : v.toFixed(3));
+  $("teeth").replaceChildren(...[
+    el("div", { class: "title" }, "Enamel thickness"),
+    el("div", { class: "sub" }, "µm, from the enamel–dentin junction"),
+    el("table", {},
+      el("thead", {}, el("tr", {}, el("th", {}, "Tooth"), el("th", {}, "Median"), el("th", {}, "Middle half"),
+        el("th", { title: "Area of the enamel–dentin junction" }, "Junction mm²"))),
+      el("tbody", {},
+        ...rows.map((t) => el("tr", {}, el("td", {}, t.name), el("td", {}, fmt(t.median)), el("td", {}, range(t)),
+          el("td", {}, area(t.junction_area_mm2)))),
+        el("tr", { class: rows.length ? "all" : "" }, el("td", {}, "All"), el("td", {}, fmt(r.median)), el("td", {}, range(r)),
+          el("td", {}, area(r.junction_area_mm2))))),
+    r.share_measured != null ? el("div", { class: "caption" }, `${fmt(100 * r.share_measured)}% of junction points measured.`) : null,
+    meta.background_from && meta.background_from !== "scan"
+      ? el("div", { class: "caption" }, "No scan around the tooth: background taken as zero.") : null,
+  ].filter(Boolean));
+}
+
+function setMode(next) {
+  if (!MODES[next] || !layers.enamel || !layers.enamel.modes[next]) return;
+  MODES[mode].vmin = vmin; MODES[mode].vmax = vmax;
+  mode = next;
+  ({ vmin, vmax } = MODES[mode]);
+  for (const id of ["vmin", "vmax"]) { $(id).step = MODES[mode].inputStep; $(id).max = MODES[mode].inputMax; }
+  $("vmin").value = vmin;
+  $("vmax").value = vmax;
+  $("unit").textContent = MODES[mode].unit;
+  document.querySelectorAll("[data-mode]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.mode === mode)));
+  renderTeeth();
+  renderLegend();
+  requestRender();
+}
+
+function setEnamel(percent) {
+  enamelAlpha = clamp(percent, 0, 100) / 100;
+  $("enamel").value = String(Math.round(enamelAlpha * 100));
+  $("enamel-val").textContent = `${Math.round(enamelAlpha * 100)}%`;
+  renderLegend();
+  requestRender();
+}
+
+function saveImage() {
+  draw();
+  const w = canvas.width, h = canvas.height, s = w / Math.max(canvas.clientWidth, 1);
+  const out = document.createElement("canvas");
+  out.width = w; out.height = h;
+  const ctx = out.getContext("2d");
+  ctx.drawImage(canvas, 0, 0);
+  const pad = 14 * s, boxW = 300 * s, boxH = 70 * s, x0 = pad, y0 = h - boxH - pad, barW = boxW - 24 * s;
+  ctx.fillStyle = "rgba(22, 27, 28, 0.92)";
+  ctx.fillRect(x0, y0, boxW, boxH);
+  ctx.font = `600 ${12 * s}px system-ui, sans-serif`;
+  ctx.fillStyle = "#e2e9e7";
+  ctx.textBaseline = "alphabetic";
+  ctx.textAlign = "left";
+  ctx.fillText(`${meta.sample}: ${MODES[mode].title.charAt(0).toLowerCase()}${MODES[mode].title.slice(1)}`, x0 + 12 * s, y0 + 20 * s);
+  const colours = MODES[mode].ramp, n = steps();
+  if (n) {
+    for (let k = 0; k < n; k++) {
+      ctx.fillStyle = colours[Math.round((n > 1 ? k / (n - 1) : 0) * (colours.length - 1))];
+      ctx.fillRect(x0 + 12 * s + (k * barW) / n, y0 + 30 * s, barW / n + 0.5, 12 * s);
+    }
+  } else {
+    const g = ctx.createLinearGradient(x0 + 12 * s, 0, x0 + 12 * s + barW, 0);
+    colours.forEach((c, i) => g.addColorStop(i / (colours.length - 1), c));
+    ctx.fillStyle = g;
+    ctx.fillRect(x0 + 12 * s, y0 + 30 * s, barW, 12 * s);
+  }
+  ctx.font = `${11 * s}px system-ui, sans-serif`;
+  ctx.fillStyle = "#a3aeac";
+  const marks = ticks();
+  marks.forEach(([at, label], i) => {
+    ctx.textAlign = i === 0 ? "left" : i === marks.length - 1 ? "right" : "center";
+    ctx.fillText(label, x0 + 12 * s + at * barW, y0 + 58 * s);
+  });
+  out.toBlob((blob) => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${meta.sample}_enamel_${mode === "thickness" ? "thickness" : mode === "thin" ? "thin_patches" : "less_dense_patches"}.png`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  });
+}
+
+// ------------------------------------------------------------------ start
+(async () => {
+  try {
+    if (!gl) throw new Error("WebGL 2 is not available in this browser.");
+    const buf = await unpack();
+    for (const [name, spec] of Object.entries(meta.layout.layers)) {
+      layers[name] = decode(buf, spec);
+      upload(layers[name]);
+    }
+    if (!layers.enamel) throw new Error("the file holds no enamel.");
+    // Fit: the centre of everything shown, and the farthest point from it.
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (const layer of Object.values(layers)) {
+      for (let i = 0; i < layer.pos.length; i++) { const c = i % 3; lo[c] = Math.min(lo[c], layer.pos[i]); hi[c] = Math.max(hi[c], layer.pos[i]); }
+    }
+    centre = lo.map((v, i) => (v + hi[i]) / 2);
+    radius = Math.max(1, Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2);
+    shade = program(SHADE);
+    pick = program(PICK);
+    ramps = { thickness: rampTexture(RAMP), thin: rampTexture(SHORT_RAMP), low_density: rampTexture(SHORT_RAMP) };
+    const shown = (meta.modes || ["thickness"]).filter((k) => layers.enamel.modes[k]);
+    document.querySelectorAll("[data-mode]").forEach((b) => {
+      b.hidden = !shown.includes(b.dataset.mode);
+      b.addEventListener("click", () => setMode(b.dataset.mode));
+    });
+    $("modes").hidden = shown.length < 2;
+
+    const scaleInput = (id, apply) => {
+      $(id).addEventListener("input", (e) => {
+        const v = parseFloat(e.target.value);
+        if (Number.isFinite(v) && apply(v)) { renderLegend(); requestRender(); }
+      });
+    };
+    scaleInput("vmin", (v) => (v >= 0 && v < vmax ? ((vmin = v), true) : false));
+    scaleInput("vmax", (v) => (v > vmin ? ((vmax = v), true) : false));
+    $("dentin").disabled = !layers.dentin;
+    $("dentin").checked = showDentin = !!layers.dentin;
+    $("dentin").addEventListener("change", (e) => { showDentin = e.target.checked; renderLegend(); requestRender(); });
+    $("enamel").addEventListener("input", (e) => setEnamel(Number(e.target.value)));
+    document.querySelectorAll("[data-view]").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
+    $("save").addEventListener("click", saveImage);
+    $("hide").addEventListener("click", () => document.body.classList.add("bare"));
+    $("show").addEventListener("click", () => document.body.classList.remove("bare"));
+    const opts = new URLSearchParams(location.hash.slice(1));
+    const num = (key) => (opts.has(key) && Number.isFinite(parseFloat(opts.get(key))) ? parseFloat(opts.get(key)) : null);
+    if (num("vmax") != null && num("vmax") > 0) vmax = num("vmax");
+    if (num("vmin") != null && num("vmin") >= 0 && num("vmin") < vmax) vmin = num("vmin");
+    $("vmin").value = vmin;
+    $("vmax").value = vmax;
+    if (opts.get("dentin") === "0") $("dentin").checked = showDentin = false;
+    if (opts.get("panels") === "0") document.body.classList.add("bare");
+    MODES.thickness.vmin = vmin; MODES.thickness.vmax = vmax;
+    document.querySelectorAll("[data-mode]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.mode === "thickness")));
+    if (MODES[opts.get("mode")] && opts.get("mode") !== "thickness") setMode(opts.get("mode"));
+    renderTeeth();
+    setEnamel(num("enamel") != null ? num("enamel") : 100);
+    setView(VIEWS[opts.get("view")] ? opts.get("view") : "side");
+    document.body.dataset.ready = "1";
+  } catch (err) {
+    console.error(err);
+    fail(`Could not show the thickness map: ${err.message}`);
+  }
+})();
+</script>
+</body>
+</html>
