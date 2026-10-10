@@ -154,10 +154,7 @@ events.out.tfevents.*
 *.onnx
 
 # Large generated poster volume payloads (keep accompanying source/metadata)
-/poster_assets/*.bin
-/poster_assets/*.u16
-/poster_assets/*.u16.gz
-/poster_assets/*.u16.gz.part*
+/poster_assets/*
 
 # Claude
 .claude/*
