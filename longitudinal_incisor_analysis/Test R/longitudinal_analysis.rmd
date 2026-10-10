@@ -1,0 +1,1620 @@
+---
+title: "Incisor Enamel Mineralization: Age, CFTR and Hif1a"
+subtitle: "Longitudinal mineralization trajectories from micro-CT density profiles across P52 and P82 Odam-Cre wildtype, a CFTR conditional knockout and a Hif1a conditional knockout"
+author: "Zhang Lab — MicroCT Analysis"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    fig_width: 9
+    fig_height: 5.5
+    df_print: kable
+params:
+  results_dir: "/Volumes/Z Drive/Incisor Enamel Analysis/RESULTS_MOLAR_BASELINE"
+  # A specimen is analyzed only if it has a CMPR resliced volume. This is the
+  # gate specified for this report: the CMPR directory is the roster, so
+  # dropping new reslices in and re-running enamel_density.py extends the
+  # report without editing anything here except `specimens`.
+  cmpr_dir: "/Volumes/Z Drive/Incisor Enamel Analysis/CMPR"
+  landmark_dirs:
+    - "/Volumes/Z Drive/Incisor Enamel Analysis/CMPR"
+    - "/Volumes/Z Drive/Incisor Enamel Analysis/RESULTS_MOLAR_BASELINE"
+  figure_dir: "figures"
+  # ---------------------------------------------------------------------
+  # Specimen metadata. Since the 2026-09-17 rename the filenames DO carry
+  # age and genotype ({Age}_{BaseMouse}_{Gene}_{N}), but they are declared
+  # here explicitly rather than parsed, so a new scan cannot silently enter
+  # the wrong group.
+  #
+  # Written "sample | genotype | age".
+  # ---------------------------------------------------------------------
+  specimens:
+    - "P52_Odam-Cre_WT_1       | WT        | P52"
+    - "P52_Odam-Cre_WT_2       | WT        | P52"
+    - "P52_Odam-Cre_WT_3       | WT        | P52"
+    - "P52_Odam-Cre_Hifla-KO_1  | Hif1a cKO | P52"
+    - "P52_Odam-Cre_Hifla-KO_2  | Hif1a cKO | P52"
+    - "P52_Odam-Cre_Hifla-KO_3  | Hif1a cKO | P52"
+    - "P82_Odam-Cre_WT_1       | WT        | P82"
+    - "P82_Odam-Cre_WT_2       | WT        | P82"
+    - "P82_Odam-Cre_WT_3       | WT        | P82"
+    - "P82_Odam-Cre_CFTR-cKO_1 | CFTR cKO  | P82"
+    - "P82_Odam-Cre_CFTR-cKO_2 | CFTR cKO  | P82"
+    - "P82_Odam-Cre_CFTR-cKO_3 | CFTR cKO  | P82"
+  # Rolling-median width, in slices, applied before the GAM.
+  median_k: 21
+  # GAM basis dimension for the trend fit.
+  gam_k: 40
+  max_z_window: 12
+  # Outlier rejection: absolute residual threshold in ratio units. Section 4
+  # shows local measurement noise is 0.0012-0.0018 in EVERY specimen, so this
+  # is ~45-65x noise uniformly and needs no per-group scaling.
+  outlier_abs: 0.08
+  n_boot: 400
+  # How a `coincident` slice is handled: "measured" keeps the fitted ratio,
+  # "force1" overwrites it with 1.0, "drop" removes it. Section 3 shows why
+  # this report uses "measured" -- the previous rule was "force1", and it
+  # fabricates a flat plateau in CFTR exactly where the phenotype lives.
+  coincident_rule: "measured"
+  exclude_samples:
+    value: []
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  dpi        = 300,
+  fig.align  = "center",
+  # ragg renders the Unicode arrow in the axis labels; the default quartz
+  # device drops it to a tofu box.
+  dev        = "ragg_png",
+  fig.path   = file.path(params$figure_dir, "")
+)
+
+library(ggplot2)
+library(ggprism)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(purrr)
+library(stringr)
+library(scales)
+library(zoo)
+library(mgcv)
+library(patchwork)
+library(ragg)
+library(jsonlite)
+
+dir.create(params$figure_dir, showWarnings = FALSE, recursive = TRUE)
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# Interpolate where a fitted curve crosses ratio = 1 (dentin density).
+#
+# Takes the LAST upward crossing after which the curve stays above 1, not the
+# first time it touches. A wiggle in the steep crossover region can nick 1.0 and
+# fall back; anchoring on that gives a crossover several % early and, at a curve
+# end, can latch onto a spurious edge crossing entirely.
+#
+# Returns NA when the curve never rises above 1 and stays there. For a severely
+# hypomineralized specimen that is the correct answer, not a failure.
+crossing_of <- function(z, fit) {
+  above <- fit >= 1
+  idx   <- which(diff(above) == 1)
+  if (length(idx) == 0) return(NA_real_)
+  i <- idx[length(idx)]
+  for (j in rev(idx)) {
+    if (all(above[(j + 1):length(above)])) i <- j
+  }
+  z[i] + (1 - fit[i]) * (z[i + 1] - z[i]) / (fit[i + 1] - fit[i])
+}
+
+# Mean fitted ratio over the mature plateau window.
+plateau_of <- function(z, fit) mean(fit[z >= 70 & z <= 95], na.rm = TRUE)
+```
+
+## Overview
+
+The mouse incisor grows continuously, so its **length is a developmental time axis**: tissue at the
+cervical loop (`z = 0 %`) was deposited most recently, tissue at the incisal tip (`z = 100 %`) is
+fully mature. A density profile along that axis therefore traces the whole of amelogenesis in a
+single specimen — secretory matrix, through maturation, to mature enamel.
+
+This report pools every specimen that has a CMPR resliced volume and runs **three comparisons plus
+one developmental reference**:
+
+| # | Comparison | Contrast isolated | Section |
+|---|---|---|---|
+| 1 | **P82 WT vs P82 CFTR cKO** | genotype, age-matched | §9 |
+| 2 | **P52 WT vs P52 Hif1a cKO** | genotype, age-matched | §10 |
+| 3 | **P82 WT vs P52 WT** | age, genotype-matched | §11 |
+| — | **Odam-Cre WT development curve** | wildtype reference, fitted per age | §12 |
+
+Every animal carries the Odam-Cre driver, including all wildtype groups, so the driver is not a
+variable anywhere in this dataset. Each knockout is compared only against its **age-matched**
+wildtype, and the age comparison uses only wildtype animals. No figure mixes a genotype difference
+with an age difference.
+
+**Age is never pooled.** It is the largest driver of the developmental pattern here, so every
+quantity that describes a trajectory — the wildtype development curve in §12, the anatomical
+landmark consensus in §7, the crossover and plateau landmarks — is computed within an age and
+reported per age. Landmarks are matched on age alone: a knockout of enamel mineralization does not
+move the molars or the eruption plane, so within an age the same landmark set serves every genotype.
+
+**The plotted quantity is the enamel/dentin ratio.** Raw intensities are scanner units, not
+mg HA/cm³, and are not comparable across scan sessions; dentin is the shared internal reference
+tissue, so the ratio is self-calibrating.
+
+**The z axis carries anatomy.** [`map_landmarks.py`](../map_landmarks.py) maps the eruption plane
+and the three molar positions onto the same `z_percent` axis the density profile uses, so positions
+on the curve can be named rather than only numbered. Every trajectory figure carries that anatomy
+strip beneath it.
+
+> **Naming.** All files were renamed on 2026-09-17 to `{Age}_{BaseMouse}_{Gene}_{N}`. The CFTR
+> specimens were previously called `P82-OdamcKo-CTR-*` — a name that reads as a control — inside a
+> folder named `NATARA-P82-CFTR`. `sample_rename_map.csv` on the Z drive maps every old path to its
+> new one.
+
+---
+
+## 1. Load every profile with a CMPR volume
+
+Each specimen contributes one `*_enamel_density_profile.csv` (one row per z-slice) and one
+`*_enamel_density_run.json` of provenance. Files are discovered rather than hard-coded, but a
+specimen is admitted only if it also has a CMPR resliced volume.
+
+```{r discover}
+csv_files <- list.files(params$results_dir,
+                        pattern = "_enamel_density_profile\\.csv$", full.names = TRUE)
+# macOS AppleDouble sidecars ("._name.csv") are not data.
+csv_files <- csv_files[!str_starts(basename(csv_files), stringr::fixed("._"))]
+
+json_files <- list.files(params$results_dir,
+                         pattern = "_enamel_density_run\\.json$", full.names = TRUE)
+json_files <- json_files[!str_starts(basename(json_files), stringr::fixed("._"))]
+
+# The CMPR directory is the roster: a specimen without a resliced volume is not
+# analyzed even if a stale profile CSV exists for it.
+cmpr_files   <- list.files(params$cmpr_dir, pattern = "_resliced_volume\\.nrrd$")
+cmpr_files   <- cmpr_files[!str_starts(cmpr_files, stringr::fixed("._"))]
+cmpr_samples <- str_remove(cmpr_files, "_resliced_volume\\.nrrd$")
+
+landmark_dirs  <- unique(params$landmark_dirs %||% params$results_dir)
+landmark_dirs  <- landmark_dirs[dir.exists(landmark_dirs)]
+landmark_files <- unlist(lapply(landmark_dirs, list.files,
+                                pattern = "_landmarks\\.csv$", full.names = TRUE))
+landmark_files <- landmark_files[!str_starts(basename(landmark_files),
+                                             stringr::fixed("._"))]
+landmark_files <- landmark_files[!duplicated(basename(landmark_files))]
+
+stopifnot(length(csv_files) > 0)
+
+profile_samples  <- str_remove(basename(csv_files), "_enamel_density_profile\\.csv$")
+landmark_samples <- str_remove(basename(landmark_files), "_landmarks\\.csv$")
+
+roster <- tibble(sample = sort(union(cmpr_samples, profile_samples))) |>
+  mutate(`CMPR volume`     = sample %in% cmpr_samples,
+         `density profile` = sample %in% profile_samples,
+         landmarks         = sample %in% landmark_samples,
+         analyzed          = `CMPR volume` & `density profile`)
+
+roster
+```
+
+```{r load}
+read_profile <- function(path) {
+  sample_id <- str_remove(basename(path), "_enamel_density_profile\\.csv$")
+
+  read_csv(path, show_col_types = FALSE, progress = FALSE) |>
+    mutate(
+      sample  = sample_id,
+      # Everything downstream is numeric; the writer emits "" for unfit rows.
+      across(
+        c(z, z_percent, z_mm, n_voxels, z_window, rim_fraction,
+          dentin_mode, dentin_reference, enamel_density, enamel_sigma,
+          enamel_ratio, enamel_fraction, separation_sigma, solidity),
+        ~ suppressWarnings(as.numeric(.x))
+      )
+    )
+}
+
+# Gate on CMPR presence before reading anything.
+csv_files <- csv_files[profile_samples %in% cmpr_samples]
+profiles  <- map(csv_files, read_profile) |> list_rbind()
+```
+
+### Specimen metadata
+
+```{r metadata}
+meta <- str_split_fixed(unlist(params$specimens), "\\|", 3) |>
+  as_tibble(.name_repair = ~ c("sample", "genotype", "age")) |>
+  mutate(across(everything(), str_trim))
+
+missing_meta <- setdiff(unique(profiles$sample), meta$sample)
+if (length(missing_meta) > 0) {
+  stop("No metadata for: ", paste(missing_meta, collapse = ", "),
+       ". Add them to the `specimens` block in the YAML header.")
+}
+
+# `group` is the analysis unit throughout: genotype crossed with age. The level
+# order places each knockout immediately after the wildtype it is tested against.
+group_levels <- c("WT P52", "Hif1a cKO P52", "WT P82", "CFTR cKO P82")
+
+# Every status enamel_density.py can emit. factor() turns an unlisted level
+# into NA silently, which would drop those slices from every filter and count
+# below without a word, so the set is asserted rather than assumed: if the
+# pipeline gains a status, this report stops instead of quietly ignoring it.
+status_levels <- c("resolved_hi", "resolved_lo", "coincident", "pre_onset",
+                   "saturated", "insufficient", "unresolvable")
+
+unknown_status <- setdiff(unique(profiles$status), status_levels)
+if (length(unknown_status)) {
+  stop("Unknown status in the profile CSVs: ",
+       paste(unknown_status, collapse = ", "),
+       ". Add it to `status_levels` and decide how sections 2, 3 and 5 should ",
+       "treat it before rerunning.")
+}
+
+# Guard against knitting over a half-finished `run_all.sh`. A `pre_onset` slice
+# carries enamel_ratio = 0 by construction; a non-zero one means that CSV was
+# written by an older build of enamel_density.py, and mixing pipeline versions
+# across specimens would put a processing difference into every between-group
+# comparison in this report.
+stale <- profiles |>
+  filter(status == "pre_onset", !is.na(enamel_ratio), enamel_ratio != 0) |>
+  distinct(sample) |>
+  pull(sample)
+if (length(stale)) {
+  stop("These profiles predate the enamel-onset change: ",
+       paste(stale, collapse = ", "),
+       ". Let run_all.sh finish, then re-knit.")
+}
+
+profiles <- profiles |>
+  left_join(meta, by = "sample") |>
+  mutate(
+    genotype = factor(genotype, levels = c("WT", "Hif1a cKO", "CFTR cKO")),
+    age      = factor(age, levels = c("P52", "P82")),
+    group    = factor(paste(genotype, age), levels = group_levels),
+    status   = factor(status, levels = status_levels)
+  )
+
+# Shared colour key. Wildtype groups are blues/greens (same genotype, different
+# age); each knockout is a warm colour that sits next to its own control.
+group_cols <- c("WT P52"        = "#2166AC",
+                "Hif1a cKO P52" = "#B2182B",
+                "WT P82"        = "#4DAF9A",
+                "CFTR cKO P82"  = "#E08214")
+
+meta |>
+  filter(sample %in% unique(profiles$sample)) |>
+  mutate(group = paste(genotype, age)) |>
+  arrange(group, sample) |>
+  select(group, genotype, age, sample)
+```
+
+```{r exclusions}
+excluded     <- params$exclude_samples %||% character(0)
+profiles_all <- profiles                       # kept for the landmark depth lookup
+profiles     <- profiles |> filter(!sample %in% excluded)
+```
+
+```{r counts, include = FALSE}
+n_by    <- function(g) n_distinct(profiles$sample[profiles$group == g])
+n_wt52  <- n_by("WT P52")
+n_hif   <- n_by("Hif1a cKO P52")
+n_wt82  <- n_by("WT P82")
+n_cftr  <- n_by("CFTR cKO P82")
+has_hif <- n_hif > 0
+```
+
+### Per-specimen slice outcomes
+
+`enamel_density.py` labels every slice with the outcome of its two-component histogram fit. That
+composition is itself a readout, and section 3 shows it is **not** ignorable here.
+
+```{r status-table}
+status_tbl <- profiles |>
+  count(group, sample, status, .drop = FALSE) |>
+  group_by(sample) |>
+  mutate(pct = 100 * n / sum(n)) |>
+  ungroup() |>
+  filter(!is.na(group))
+
+status_tbl |>
+  select(group, sample, status, pct) |>
+  pivot_wider(names_from = status, values_from = pct, values_fill = 0) |>
+  mutate(across(where(is.numeric), ~ round(.x, 1))) |>
+  arrange(group, sample)
+```
+
+```{r fig-status, fig.height = 5, fig.cap = "Slice-outcome composition per specimen. `pre_onset` is the pre-enamel zone at the cervical loop, cervical to the density minimum that marks the start of secretory matrix; those slices contain no enamel and are separated from `coincident`, which is enamel that exists but cannot be resolved from dentin. Section 3 shows the coincident excess in CFTR is a phenotype, not a processing artifact."}
+ggplot(status_tbl, aes(x = sample, y = pct, fill = status)) +
+  geom_col(width = 0.75) +
+  coord_flip() +
+  facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_brewer(palette = "RdYlBu", direction = -1, drop = FALSE) +
+  labs(x = NULL, y = "% of slices", fill = NULL) +
+  theme_prism(base_size = 11) +
+  theme(legend.position = "bottom",
+        strip.text.y = element_text(angle = 0, hjust = 0))
+```
+
+---
+
+## 2. Quality filtering
+
+Filters, each from a documented caveat in the pipeline README:
+
+1. **Measurable statuses only.** `resolved_hi`, `resolved_lo` and `coincident` carry a density;
+   `unresolvable` / `insufficient` do not.
+   `pre_onset` is excluded here for a different reason, and the distinction matters. Those
+   slices lie cervical to the start of enamel — the cross-section is dentin plus enamel-organ
+   soft tissue, with no enamel in it — so the pipeline reports `enamel_ratio = 0`, meaning
+   *none of it*, not *could not measure*. That zero is a true value but it is not a point on
+   the mineralization curve, and leaving it in would drag every group mean and GAM fit toward
+   0 across the cervical decile. Section 9 uses its **prevalence** instead, where the
+   extent of the pre-enamel zone is the quantity of interest.
+2. **`z_window` cap.** A wide pooling window means that point traded z-resolution for histogram
+   signal.
+3. **`solidity` floor on `resolved_lo` rows.** This is the primary evidence that a low-density
+   component is real secretory matrix rather than partial-volume rim — genuine matrix scores
+   ≥ 0.10, rim scores 0.00–0.01.
+
+```{r qc}
+measured <- profiles |>
+  filter(
+    status %in% c("resolved_hi", "resolved_lo", "coincident"),
+    z_window <= params$max_z_window,
+    !(status == "resolved_lo" & (is.na(solidity) | solidity < 0.10))
+  ) |>
+  filter(!is.na(enamel_ratio))
+
+# Belt and braces on the pre-enamel zero. The status whitelist above already
+# excludes `pre_onset`, but a ratio of exactly 0 is never a measurement of
+# enamel anywhere in this pipeline, and if one ever reaches the smoother it
+# would pull a group mean down by a full ratio unit while looking like data.
+stopifnot(!any(measured$enamel_ratio == 0, na.rm = TRUE))
+
+bind_rows(
+  profiles |> mutate(stage = "all slices"),
+  measured |> mutate(stage = "after QC")
+) |>
+  group_by(group, stage) |>
+  summarise(slices = n(), .groups = "drop") |>
+  pivot_wider(names_from = stage, values_from = slices) |>
+  mutate(`% retained` = round(100 * `after QC` / `all slices`, 1)) |>
+  select(group, `all slices`, `after QC`, `% retained`)
+```
+
+---
+
+## 3. What a `coincident` slice is, and why it is not forced to 1.0
+
+**This section changes a rule the previous version of this report used, and the change matters most
+for the group the report was rebuilt to analyze.**
+
+A slice is labelled `coincident` when the enamel and dentin histogram modes are too close to
+separate at the configured confidence. The previous rule treated that as a *measurement* of "enamel
+equals dentin" and overwrote the ratio with exactly 1.0, on the reasoning that dropping the slices
+would delete the crossover. That reasoning holds when `coincident` is rare and confined to the
+crossover. It fails here.
+
+**One class of `coincident` slice has been removed upstream since the previous version of this
+report.** `enamel_density.py` now identifies the enamel onset — the profile's density minimum,
+which is the secretory matrix, the least mineralized enamel on the tooth — and relabels everything
+cervical to it as `pre_onset`. Those slices used to be reported as `coincident` with a ratio near
+1.03, which asserted that enamel was present at dentin density; in fact there is no enamel there at
+all, only dentin and enamel-organ soft tissue at a coincidentally similar attenuation. The counts
+below are therefore smaller than in the previous run, and the ones that remain are `coincident` in
+the sense this section is about: enamel that exists but cannot be separated from dentin. The
+distinction sharpens the argument rather than weakening it — the cervical bins no longer mix a
+detection failure with a region that has nothing to detect.
+
+```{r coincident-where}
+profiles |>
+  filter(status == "coincident") |>
+  mutate(bin = cut(z_percent, breaks = seq(0, 100, 10),
+                   labels = sprintf("%d–%d", seq(0, 90, 10), seq(10, 100, 10)),
+                   include.lowest = TRUE)) |>
+  count(group, bin) |>
+  pivot_wider(names_from = bin, values_from = n, values_fill = 0)
+```
+
+In wildtype, `coincident` sits where it should — a thin band at the crossover. In **CFTR cKO it is
+spread across the whole maturation zone**, because that is where knockout enamel and dentin
+genuinely have similar densities. Those slices are not all failed crossover fits.
+
+The test that decides the rule: for each `coincident` slice, compare its own fitted ratio against
+the local median of nearby **resolved** slices in the same specimen. If forcing 1.0 were harmless,
+that neighbourhood would already sit near 1.
+
+```{r coincident-neighbours}
+neighbour_check <- measured |>
+  arrange(sample, z) |>
+  group_by(sample) |>
+  group_modify(function(d, key) {
+    res <- d$status %in% c("resolved_hi", "resolved_lo")
+    ci  <- which(d$status == "coincident")
+    if (length(ci) == 0) return(tibble())
+    map_dfr(ci, function(i) {
+      m <- abs(d$z - d$z[i]) <= 25 & res
+      if (sum(m) < 5) return(tibble())
+      tibble(own = d$enamel_ratio[i],
+             nbr = median(d$enamel_ratio[m], na.rm = TRUE))
+    })
+  }) |>
+  ungroup() |>
+  left_join(meta, by = "sample") |>
+  mutate(group = factor(paste(genotype, age), levels = group_levels))
+
+neighbour_check |>
+  group_by(group) |>
+  summarise(
+    `n coincident`        = n(),
+    `median own ratio`    = round(median(own, na.rm = TRUE), 3),
+    `median neighbour`    = round(median(nbr, na.rm = TRUE), 3),
+    `% neighbours > 1.10` = round(100 * mean(nbr > 1.10, na.rm = TRUE)),
+    .groups = "drop"
+  )
+```
+
+**In CFTR cKO roughly half of all `coincident` slices sit in a neighbourhood whose resolved slices
+are already well above 1.1.** Forcing those to 1.0 does not record "enamel equals dentin" — it pulls
+a real, measurably-above-dentin stretch of curve down onto the reference line.
+
+The arithmetic consequence, per group, as the largest distortion any z-bin suffers:
+
+```{r coincident-impact}
+bin_curve <- function(rule) {
+  d <- measured
+  if (rule == "force1") {
+    d <- d |> mutate(enamel_ratio = if_else(status == "coincident", 1, enamel_ratio))
+  } else if (rule == "drop") {
+    d <- d |> filter(status != "coincident")
+  }
+  d |>
+    mutate(bin = cut(z_percent, breaks = seq(0, 100, 5), include.lowest = TRUE)) |>
+    group_by(group, bin) |>
+    summarise(v = median(enamel_ratio, na.rm = TRUE), .groups = "drop") |>
+    mutate(rule = rule)
+}
+
+impact <- bind_rows(bin_curve("measured"), bin_curve("force1"), bin_curve("drop")) |>
+  pivot_wider(names_from = rule, values_from = v) |>
+  filter(!is.na(measured))
+
+impact |>
+  group_by(group) |>
+  summarise(
+    `max |force1 - measured|` = round(max(abs(force1 - measured), na.rm = TRUE), 3),
+    `max |drop - measured|`   = round(max(abs(drop   - measured), na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+```
+
+Both alternatives distort, in opposite directions. `force1` flattens the curve onto 1.0; dropping
+the slices biases it *upward*, by deleting the lowest-density measurements in a region where they
+are real. **Neither is neutral, so this report keeps the measured ratio** and treats the
+*prevalence* of `coincident` as a phenotype readout in its own right (section 9).
+
+```{r coincident-apply}
+if (params$coincident_rule == "force1") {
+  measured <- measured |>
+    mutate(enamel_ratio = if_else(status == "coincident", 1, enamel_ratio))
+} else if (params$coincident_rule == "drop") {
+  measured <- measured |> filter(status != "coincident")
+}
+```
+
+---
+
+## 4. Outlier rejection, kept separate from smoothing
+
+These two are routinely conflated. They address different defects, and the distinction is
+load-bearing here:
+
+- An **outlier** is a slice whose two-component fit landed on the wrong mode. It is *wrong*, and
+  averaging it in corrupts its neighbourhood. It must be removed.
+- **Noise** is the small slice-to-slice scatter of correct measurements. It is *right but
+  imprecise*, and smoothing is the correct response.
+
+Confusing them is dangerous in both directions: rejecting real structure as outliers deletes
+biology, and smoothing a genuinely discontinuous curve manufactures continuity that was never
+measured.
+
+### The measurement noise is tiny, and uniform across groups
+
+```{r noise-scale}
+noise_tbl <- measured |>
+  arrange(sample, z) |>
+  group_by(group, sample) |>
+  summarise(
+    n             = n(),
+    `local noise` = mad(diff(enamel_ratio)) / sqrt(2),
+    `curve span`  = as.numeric(diff(quantile(enamel_ratio, c(0.05, 0.95), na.rm = TRUE))),
+    .groups = "drop"
+  ) |>
+  mutate(SNR = `curve span` / `local noise`,
+         `threshold / noise` = params$outlier_abs / `local noise`)
+
+noise_tbl |>
+  mutate(`local noise` = round(`local noise`, 5),
+         `curve span`  = round(`curve span`, 3),
+         SNR           = round(SNR),
+         `threshold / noise` = round(`threshold / noise`)) |>
+  arrange(group, sample)
+```
+
+Two things follow, and they cut against the naive reading of these traces as "noisy":
+
+1. **Local noise is 0.0012–0.0018 ratio units in every specimen**, knockout and wildtype alike. The
+   absolute threshold of `r params$outlier_abs` is therefore ~45–65× the noise *uniformly*, so it
+   does not need per-group scaling despite the CFTR curve spanning half the range of wildtype.
+2. **Signal-to-noise exceeds 400 everywhere.** These traces carry almost no high-frequency scatter.
+   What looks like noise in the CFTR ratio plot is **discontinuity** — gaps where slices are
+   unmeasurable, and status changes between adjacent slices — not jitter. Sections 5 and 6 are
+   built around that distinction.
+
+### The rule
+
+Reject a slice when its residual from **its own specimen's** trend exceeds `r params$outlier_abs`
+ratio units. Per-specimen so a genuine between-animal offset is not scored as error; absolute so the
+bar is identical for every specimen in every group.
+
+```{r outliers}
+fit_gam <- function(data, yvar = "enamel_ratio") {
+  bam(reformulate(sprintf("s(z_percent, bs = 'tp', k = %d)", params$gam_k),
+                  response = yvar),
+      data = data, discrete = TRUE)
+}
+
+# Iteratively reweighted rejection: refit on the kept set, rescore, repeat until
+# the kept set stops changing, so a gross outlier cannot drag the trend toward
+# itself and mask its neighbours.
+flag_outliers <- function(data, threshold = params$outlier_abs, max_iter = 10) {
+  keep  <- rep(TRUE, nrow(data))
+  resid <- rep(NA_real_, nrow(data))
+  for (i in seq_len(max_iter)) {
+    m     <- fit_gam(data[keep, , drop = FALSE])
+    resid <- data$enamel_ratio - as.numeric(predict(m, newdata = data))
+    new   <- abs(resid) <= threshold
+    if (identical(new, keep)) break
+    keep <- new
+  }
+  tibble(is_outlier = !keep, residual = resid)
+}
+
+scored <- measured |>
+  group_by(sample) |>
+  group_modify(~ bind_cols(.x, flag_outliers(.x))) |>
+  ungroup()
+
+clean <- scored |> filter(!is_outlier)
+
+scored |>
+  group_by(group, sample) |>
+  summarise(n = n(), rejected = sum(is_outlier),
+            `% rejected` = round(100 * mean(is_outlier), 1), .groups = "drop") |>
+  arrange(group, sample)
+```
+
+### Are the rejected slices independently bad?
+
+The residual selected them, so the check has to use something the residual never saw — the
+pipeline's own fit-quality statistics:
+
+```{r outlier-evidence}
+scored |>
+  group_by(Slices = if_else(is_outlier, "rejected", "retained")) |>
+  summarise(
+    n                       = n(),
+    `median separation (σ)` = round(median(separation_sigma, na.rm = TRUE), 2),
+    `median d-statistic`    = round(median(d_statistic, na.rm = TRUE)),
+    `median rim fraction`   = round(median(rim_fraction, na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+```
+
+```{r outlier-location}
+scored |>
+  mutate(bin = cut(z_percent, breaks = seq(0, 100, 10),
+                   labels = sprintf("%d–%d", seq(0, 90, 10), seq(10, 100, 10)),
+                   include.lowest = TRUE)) |>
+  filter(is_outlier) |>
+  count(group, bin) |>
+  pivot_wider(names_from = bin, values_from = n, values_fill = 0)
+```
+
+Rejections concentrate in the crossover region, where enamel and dentin densities are closest and
+the two-component fit is hardest. That is the expected place for a mode-flip.
+
+---
+
+## 5. Where the curve is genuinely unmeasurable
+
+Before smoothing anything, coverage has to be explicit: a smoother will happily interpolate across a
+region where no measurement exists and present the result as data.
+
+Coverage here means **"is there enamel to measure, and was it measured?"**, so `pre_onset` counts
+as not measurable alongside `unresolvable`. The two are unmeasurable for opposite reasons —
+`unresolvable` is a cross-section too thin to read, `pre_onset` is a cross-section read
+successfully that contains no enamel — but for the purpose of deciding where a curve may be
+drawn they are the same: there is no point on the mineralization curve at that z.
+
+```{r coverage}
+coverage <- profiles |>
+  mutate(measurable = status %in% c("resolved_hi", "resolved_lo", "coincident"),
+         bin = cut(z_percent, breaks = seq(0, 100, 10),
+                   labels = sprintf("%d–%d", seq(0, 90, 10), seq(10, 100, 10)),
+                   include.lowest = TRUE)) |>
+  group_by(group, sample, bin) |>
+  summarise(pct_measurable = 100 * mean(measurable), .groups = "drop")
+
+coverage |>
+  group_by(group, bin) |>
+  summarise(`% measurable` = round(mean(pct_measurable)), .groups = "drop") |>
+  pivot_wider(names_from = bin, values_from = `% measurable`, values_fill = 0)
+```
+
+Coverage collapses at the cervical end in every group — that is the cervical loop, where there is
+little mineralized tissue to measure. **Curves are therefore not extrapolated below the first
+z-bin in which a group reaches 50 % mean coverage**, enforced in code rather than by eye:
+
+```{r coverage-limit}
+z_floor <- coverage |>
+  group_by(group, bin) |>
+  summarise(m = mean(pct_measurable), .groups = "drop") |>
+  filter(m >= 50) |>
+  mutate(lo = as.numeric(str_extract(as.character(bin), "^[0-9]+"))) |>
+  group_by(group) |>
+  summarise(z_min = min(lo), .groups = "drop")
+
+z_floor
+```
+
+---
+
+## 6. Smoothing
+
+The evidence in section 4 dictates the approach. SNR is >400, so there is little high-frequency
+noise to remove and heavy smoothing would buy nothing while risking real structure. Smoothing is
+therefore kept light, and the figures are built to **show gaps rather than bridge them**.
+
+**Stage 1 — per-specimen rolling median.** A `r params$median_k`-slice centred median suppresses
+single-slice spikes while preserving the steep crossover a mean would round off. `partial = FALSE`
+so no values are fabricated at the ends, where the curve is steepest.
+
+Crucially the window is defined in **slice index**, and is invalidated wherever it would span a gap,
+so a run of missing slices is never silently bridged:
+
+```{r smooth}
+roll_med_gapped <- function(x, z, k) {
+  if (length(x) < k) return(rep(NA_real_, length(x)))
+  out <- zoo::rollapply(x, width = k, FUN = median, na.rm = TRUE,
+                        fill = NA_real_, align = "center", partial = FALSE)
+  # A centred window of width k is only meaningful if it covers k CONSECUTIVE
+  # slices. Where z jumps, the window straddles a gap: drop it.
+  zspan <- zoo::rollapply(z, width = k, FUN = function(v) max(v) - min(v),
+                          fill = NA_real_, align = "center", partial = FALSE)
+  out[is.na(zspan) | zspan > (k - 1) * 1.5] <- NA_real_
+  out
+}
+
+smoothed <- clean |>
+  arrange(sample, z) |>
+  group_by(sample) |>
+  mutate(
+    ratio_med   = roll_med_gapped(enamel_ratio,   z, params$median_k),
+    density_med = roll_med_gapped(enamel_density, z, params$median_k)
+  ) |>
+  ungroup()
+
+smoothed |>
+  group_by(group, sample) |>
+  summarise(`slices in` = n(),
+            `smoothed out` = sum(!is.na(ratio_med)),
+            `dropped at gaps` = sum(is.na(ratio_med)),
+            .groups = "drop") |>
+  arrange(group, sample)
+```
+
+**Stage 2 — GAM trend.** A penalized thin-plate spline across the specimens of a group gives that
+group's consensus curve, restricted to the coverage floor from section 5.
+
+```{r gam}
+fit_trend <- function(data, yvar, n_out = 400, z_min = NULL) {
+  data <- data |> filter(!is.na(.data[[yvar]]))
+  if (!is.null(z_min) && is.finite(z_min)) data <- data |> filter(z_percent >= z_min)
+  m <- gam(reformulate(sprintf("s(z_percent, bs = 'tp', k = %d)", params$gam_k),
+                       response = yvar),
+           data = data, method = "REML")
+  grid <- tibble(z_percent = seq(min(data$z_percent), max(data$z_percent),
+                                 length.out = n_out))
+  grid |> mutate(fit = as.numeric(predict(m, newdata = grid)))
+}
+
+trend_by_group <- smoothed |>
+  filter(!is.na(ratio_med)) |>
+  left_join(z_floor, by = "group") |>
+  group_by(group) |>
+  group_modify(function(d, key) fit_trend(d, "ratio_med", z_min = d$z_min[1])) |>
+  ungroup()
+```
+
+---
+
+## 7. Confidence intervals and anatomy
+
+**The unit of replication is the specimen, not the slice.** A tooth contributes ~1 100 slices, but
+they are not 1 100 independent observations of its group: they come from one animal, one scan and
+one dentin anchor, and the pipeline's `z_window` pooling correlates neighbours further.
+
+The bands below are **cluster bootstraps**: resample the specimens of a group with replacement
+`r params$n_boot` times, refit, take the 2.5th/97.5th percentiles. At n = 2–3 per group the
+bootstrap has few distinct resamples, so these describe between-animal spread, **not** a
+significance test.
+
+```{r bootstrap}
+boot_trend <- function(data, yvar, n_boot = params$n_boot, n_out = 400, z_min = NULL) {
+  if (!is.null(z_min) && is.finite(z_min)) data <- data |> filter(z_percent >= z_min)
+  data <- data |> filter(!is.na(.data[[yvar]]))
+  ids  <- unique(data$sample)
+  grid <- seq(min(data$z_percent), max(data$z_percent), length.out = n_out)
+  fits <- matrix(NA_real_, nrow = n_boot, ncol = n_out)
+
+  for (b in seq_len(n_boot)) {
+    pick <- sample(ids, length(ids), replace = TRUE)
+    d <- map_dfr(seq_along(pick),
+                 \(i) data |> filter(sample == pick[i]) |> mutate(.rep = i))
+    if (n_distinct(d$z_percent) < params$gam_k) next
+    # bam(discrete = TRUE) is equivalent to gam() here and ~35x faster, which
+    # is what makes a few hundred resamples practical.
+    m <- try(bam(reformulate(sprintf("s(z_percent, bs = 'tp', k = %d)", params$gam_k),
+                             response = yvar), data = d, discrete = TRUE),
+             silent = TRUE)
+    if (inherits(m, "try-error")) next
+    fits[b, ] <- as.numeric(predict(m, newdata = tibble(z_percent = grid)))
+  }
+
+  tibble(z_percent = grid,
+         lower = apply(fits, 2, quantile, 0.025, na.rm = TRUE),
+         upper = apply(fits, 2, quantile, 0.975, na.rm = TRUE))
+}
+
+set.seed(42)
+bands <- smoothed |>
+  filter(!is.na(ratio_med)) |>
+  left_join(z_floor, by = "group") |>
+  group_by(group) |>
+  group_modify(function(d, key) boot_trend(d, "ratio_med", z_min = d$z_min[1])) |>
+  ungroup()
+
+trend_by_group <- trend_by_group |> left_join(bands, by = c("group", "z_percent"))
+```
+
+### Anatomical landmarks
+
+`map_landmarks.py` marks the eruption plane and the mesial/distal boundaries of the three molars by
+hand in napari on the reoriented volume, then maps them through the same CMPR centerline the density
+profile uses. A landmark is a *z-plane*, so molars arrive as spans and eruption as a single event.
+
+The landmark file's `z_percent` is used **as delivered**, and the delivered files were regenerated
+on 2026-09-17 after a mirroring bug was fixed in `map_landmarks.py`.
+
+That bug: `cmpr.py` does not promise which end of the incisor it starts tracing from, and on these
+specimens it starts at the **tip**. `map_landmarks.py` nonetheless treated centerline index 0 as the
+cervical loop, so every landmark came out mirrored — molars ordered M1, M2, M3 *away* from the
+incisor and the eruption plane sitting cervical to all of them, which cannot happen. The fix detects
+the tip end from mineralization (mature enamel is the densest tissue in the scan) and reports arc
+length from the cervical loop so the two columns cannot disagree.
+
+Correct anatomy, which the check below enforces: **M3 < M2 < M1 < eruption** in `z_percent`. M1 is
+the mesial molar, nearest the incisor, and the tooth emerges in front of the whole molar row.
+
+```{r landmark-load}
+read_landmarks <- function(path) {
+  read_csv(path, show_col_types = FALSE, progress = FALSE) |>
+    mutate(
+      sample = str_remove(basename(path), "_landmarks\\.csv$"),
+      across(c(z_percent_start, z_percent_end, z_percent_mid, extent_percent,
+               z_start, z_end, slice_start, slice_end,
+               arc_length_start_mm, arc_length_end_mm, length_mm, z_residual_vox),
+             ~ suppressWarnings(as.numeric(.x)))
+    )
+}
+
+anat_all <- if (length(landmark_files) > 0) {
+  map(landmark_files, read_landmarks) |> list_rbind()
+} else tibble()
+
+# ---------------------------------------------------------------------------
+# Landmark axis convention. READ THIS BEFORE "FIXING" IT.
+#
+# An earlier version of this report rewrote z_percent here, on the belief that
+# map_landmarks.py had mirrored it by falling back to `tip-high-z`. That repair
+# was wrong, and it silently reversed the molar order under every figure. The
+# actual conventions are:
+#
+#   * `slice_start`/`slice_end` in the landmark file are CMPR CENTERLINE
+#     indices, and they run cervical loop -> tip: arc_length_start_mm rises
+#     monotonically with slice_start (eruption 4.5 mm @ 491, M3 10.3 mm @ 1148).
+#     So z_percent = 100 * slice / (depth - 1), which is what the file already
+#     contains.
+#
+#   * `z` in the density profile is a VOLUME index on the same resliced stack
+#     (both are depth 1410 here) but the profile's own z_percent runs the other
+#     way (corr(z, z_percent) = -1), because enamel_density.py labelled the
+#     specimen `tip-low-z`.
+#
+# Those two facts are not in conflict: the profile already reports z_percent in
+# trajectory order, and so does the landmark file. Re-deriving one from the
+# other's orientation flag mixes the two index spaces and mirrors the result.
+#
+# The file's z_percent is therefore used as delivered. The check below is what
+# catches a genuine mirroring, and it is now an independent test rather than a
+# tautology: arc length must increase from cervical loop to tip.
+if (nrow(anat_all) > 0) {
+  anat_all <- anat_all |>
+    left_join(profiles_all |>
+                group_by(sample) |>
+                summarise(depth = n_distinct(z), .groups = "drop"),
+              by = "sample") |>
+    mutate(
+      # Spans are already stored in trajectory order by map_landmarks.py, but
+      # normalise defensively so `extent` and the figures cannot be fed a
+      # reversed span.
+      z_percent_start = pmin(z_percent_start, z_percent_end, na.rm = TRUE),
+      z_percent_end   = if_else(kind == "span",
+                                pmax(z_percent_start, z_percent_end, na.rm = TRUE),
+                                NA_real_),
+      z_percent_mid   = if_else(kind == "span",
+                                (z_percent_start + z_percent_end) / 2, z_percent_start),
+      extent_percent  = if_else(kind == "span",
+                                abs(z_percent_end - z_percent_start), NA_real_)
+    ) |>
+    left_join(meta, by = "sample") |>
+    mutate(landmark = factor(landmark, levels = c("eruption", "M1", "M2", "M3")),
+           group    = factor(paste(genotype, age), levels = group_levels)) |>
+    arrange(sample, landmark)
+}
+
+anat <- anat_all |> filter(!sample %in% excluded)
+
+if (nrow(anat) > 0) {
+  anat |>
+    distinct(group, sample, depth) |>
+    transmute(group, sample, `depth (slices)` = depth) |>
+    arrange(group, sample)
+}
+```
+
+```{r landmark-sanity}
+# Independent check that the landmark axis is not mirrored, using arc length --
+# a quantity the z_percent conversion never touches. Arc length is measured
+# from the cervical loop, so it must RISE with z_percent. If a future
+# map_landmarks.py run does mirror the axis, this fails loudly instead of
+# quietly reversing the molar order beneath every figure.
+if (nrow(anat) > 0) {
+  arc_ok <- anat |>
+    filter(!is.na(arc_length_start_mm)) |>
+    group_by(sample) |>
+    filter(n() >= 3) |>
+    summarise(rho = cor(z_percent_start, arc_length_start_mm), .groups = "drop")
+
+  if (any(arc_ok$rho < 0.9)) {
+    stop("Landmark z_percent disagrees with arc length in: ",
+         paste(arc_ok$sample[arc_ok$rho < 0.9], collapse = ", "),
+         ". The axis is mirrored -- see the convention note above.")
+  }
+
+  # Anatomical order along the tooth. M1 is the mesial molar, nearest the
+  # incisor, so on this axis it sits TIPWARD of M2 and M3: M3 < M2 < M1. The
+  # eruption plane is tipward of all three -- the tooth emerges in front of
+  # the molar row.
+  ord <- anat |>
+    select(sample, landmark, z_percent_mid) |>
+    tidyr::pivot_wider(names_from = landmark, values_from = z_percent_mid)
+  stopifnot(all(ord$M3 < ord$M2, na.rm = TRUE),
+            all(ord$M2 < ord$M1, na.rm = TRUE),
+            all(ord$M1 < ord$eruption, na.rm = TRUE))
+
+  tibble(check = c("arc length rises with z_percent (min rho)",
+                   "M3 < M2 < M1 < eruption in all specimens"),
+         value = c(sprintf("%.3f", min(arc_ok$rho)), "yes"))
+}
+```
+
+```{r landmark-table}
+if (nrow(anat) > 0) {
+  anat |>
+    transmute(group, sample, landmark, kind,
+              `z start (%)`    = round(z_percent_start, 1),
+              `z end (%)`      = round(z_percent_end, 1),
+              `z mid (%)`      = round(z_percent_mid, 1),
+              `extent (%)`     = round(extent_percent, 1),
+              `length (mm)`    = round(length_mm, 2),
+              `residual (vox)` = round(z_residual_vox, 2))
+}
+```
+
+**The consensus is built per age, not pooled.** The incisor lengthens between P52 and P82 while the
+molar row stays put in the jaw, so the same anatomical structure lands at a different `z_percent` at
+the two ages. Averaging the ages together would place every landmark at a position that describes
+neither, and it is the age axis (§11) and the development curve (§12) that would be read against
+that wrong frame. Landmarks are therefore consensused within age, and every figure is drawn against
+the strip for the age it shows. Genotype is deliberately *not* a stratifying variable here: a
+knockout of enamel mineralization does not move the molars, so a landmark set is shared by all
+specimens of an age, and pooling across genotype is what gives each age a usable n.
+
+```{r landmark-consensus}
+# Consensus within an arbitrary subset of `anat`. Used per age below, and by
+# anat_strip() to draw the age-matched strip under each figure.
+consensus_of <- function(d) {
+  if (nrow(d) == 0) return(tibble())
+  d |>
+    group_by(landmark, kind) |>
+    summarise(n = n(),
+              n_samples   = n_distinct(sample),
+              start_mean  = mean(z_percent_start), end_mean  = mean(z_percent_end),
+              mid_mean    = mean(z_percent_mid),
+              start_min   = min(z_percent_start),  start_max = max(z_percent_start),
+              end_min     = min(z_percent_end),    end_max   = max(z_percent_end),
+              extent_mean = mean(extent_percent),  length_mean = mean(length_mm),
+              .groups = "drop") |>
+    arrange(mid_mean)
+}
+
+# One consensus per age that has any picks.
+anat_by_age <- if (nrow(anat) > 0) {
+  anat |>
+    group_by(age) |>
+    group_modify(function(d, key) consensus_of(d)) |>
+    ungroup()
+} else tibble()
+
+# Which ages actually have landmarks, and which are still waiting on picks.
+ages_present   <- sort(unique(meta$age))
+ages_landmarked <- if (nrow(anat_by_age) > 0) sort(unique(anat_by_age$age)) else character(0)
+ages_missing    <- setdiff(ages_present, ages_landmarked)
+
+if (nrow(anat_by_age) > 0) {
+  anat_by_age |>
+    transmute(age, landmark, n = n_samples,
+              `z start (%)` = round(start_mean, 1),
+              `z end (%)`   = round(end_mean, 1),
+              `z mid (%)`   = round(mid_mean, 1),
+              `spread, start (%)` = if_else(is.na(start_min), NA_character_,
+                                            sprintf("%.1f – %.1f", start_min, start_max)),
+              `extent (%)`  = round(extent_mean, 1),
+              `length (mm)` = round(length_mean, 2)) |>
+    arrange(age, `z mid (%)`)
+}
+```
+
+```{r landmark-coverage, echo = FALSE, results = "asis"}
+# State the coverage in the report rather than in a comment: which ages have an
+# age-matched strip, and which are currently drawn without one.
+picked <- if (nrow(anat) > 0) {
+  anat |> distinct(age, sample) |> count(age, name = "n") |>
+    mutate(txt = sprintf("**%s**: %d specimen%s", age, n, if_else(n == 1, "", "s"))) |>
+    pull(txt) |> paste(collapse = "; ")
+} else "none"
+
+cat(sprintf("> **Landmark coverage.** Picked so far — %s.\n", picked))
+if (length(ages_missing) > 0) {
+  cat(sprintf(paste0("> No landmarks yet for **%s**, so figures at that age are drawn with an ",
+                     "empty anatomy strip and no eruption line rather than borrowing the other ",
+                     "age's frame. Dropping those picks in and re-knitting fills them in with ",
+                     "nothing else to change.\n"),
+              paste(ages_missing, collapse = ", ")))
+}
+cat(paste0("> Within an age the landmark set is shared across genotypes by design. ",
+           "Treat the strip as a reference frame, not as a per-group measurement, ",
+           "until more specimens are picked.\n"))
+```
+
+```{r anat-layer, include = FALSE}
+anat_levels <- c("eruption", "M1", "M2", "M3")
+
+# Landmarks for ONE age. Every consumer below goes through this, so nothing can
+# silently fall back to a pooled-across-age frame: an age with no picks yet
+# returns an empty tibble and its figures are drawn without anatomy.
+consensus_at <- function(ages) {
+  if (nrow(anat_by_age) == 0) return(tibble())
+  ages <- unique(ages[!is.na(ages)])
+  # Only a single-age request can carry an age-matched frame. A figure spanning
+  # two ages (the §11 age contrast, §13 orientation) gets no strip, because
+  # there is no one anatomy that describes both.
+  if (length(ages) != 1) return(tibble())
+  anat_by_age |> filter(age == ages)
+}
+
+# Eruption plane for one age, NA when that age has no picks.
+erupt_at <- function(ages) {
+  d <- consensus_at(ages)
+  if (nrow(d) == 0) return(NA_real_)
+  v <- d$mid_mean[d$landmark == "eruption"]
+  if (length(v) == 0) NA_real_ else v[1]
+}
+
+# Age of a set of groups, as labelled in `meta`; length > 1 means mixed ages.
+age_of_groups <- function(groups) {
+  unique(meta$age[paste(meta$genotype, meta$age) %in% as.character(groups)])
+}
+
+# Reusable anatomy strip for one age. Dark bars are the mean molar extent, pale
+# flanking blocks the range across the specimens of that age.
+anat_strip <- function(ages = NULL) {
+  ac <- consensus_at(ages)
+  if (nrow(ac) == 0) {
+    return(ggplot() + theme_void() +
+             labs(x = "Position along incisor (% length,  cervical loop → incisal tip)"))
+  }
+  spans <- ac |> filter(kind == "span")
+  event <- ac |> filter(kind == "event")
+
+  ggplot() +
+    geom_rect(data = spans,
+              aes(xmin = start_min, xmax = end_max,
+                  ymin = as.numeric(landmark) - 0.3, ymax = as.numeric(landmark) + 0.3),
+              fill = "#1B7837", alpha = 0.25) +
+    geom_rect(data = spans,
+              aes(xmin = start_mean, xmax = end_mean,
+                  ymin = as.numeric(landmark) - 0.3, ymax = as.numeric(landmark) + 0.3),
+              fill = "#1B7837", alpha = 0.85) +
+    geom_text(data = spans, aes(x = mid_mean, y = as.numeric(landmark), label = landmark),
+              colour = "white", fontface = "bold", size = 3.2) +
+    geom_rect(data = event,
+              aes(xmin = start_min, xmax = start_max,
+                  ymin = as.numeric(landmark) - 0.3, ymax = as.numeric(landmark) + 0.3),
+              fill = "#762A83", alpha = 0.3) +
+    geom_segment(data = event,
+                 aes(x = mid_mean, xend = mid_mean,
+                     y = as.numeric(landmark) - 0.3, yend = as.numeric(landmark) + 0.3),
+                 colour = "#762A83", linewidth = 1.2) +
+    geom_text(data = event, aes(x = mid_mean, y = as.numeric(landmark), label = landmark),
+              colour = "#762A83", fontface = "bold", size = 3.2, hjust = -0.2) +
+    scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 20),
+                       guide = guide_prism_minor(), minor_breaks = seq(0, 100, 10)) +
+    scale_y_continuous(breaks = NULL, limits = c(0.5, length(anat_levels) + 0.5)) +
+    # Name the age on the strip itself, so a figure can never be read against an
+    # anatomy frame whose age the reader has to infer.
+    labs(x = "Position along incisor (% length,  cervical loop → incisal tip)", y = NULL,
+         subtitle = sprintf("%s anatomy (n = %d)", ac$age[1], max(ac$n_samples))) +
+    theme_prism(base_size = 11)
+}
+
+# Trajectory panel for an arbitrary set of groups. The eruption line is the one
+# for the groups' age, and is omitted when they span ages or that age has no
+# picks yet.
+traj_panel <- function(groups, title = NULL) {
+  erupt <- erupt_at(age_of_groups(groups))
+  d <- trend_by_group |> filter(group %in% groups) |> droplevels()
+  p <- ggplot(d, aes(x = z_percent, colour = group, fill = group)) +
+    geom_hline(yintercept = 1, linetype = "dashed", colour = "grey35", linewidth = 0.5) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.22, colour = NA) +
+    geom_line(aes(y = fit), linewidth = 1.2) +
+    scale_colour_manual(values = group_cols, drop = TRUE) +
+    scale_fill_manual(values = group_cols, drop = TRUE) +
+    scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 20),
+                       guide = guide_prism_minor(), minor_breaks = seq(0, 100, 10)) +
+    scale_y_continuous(guide = guide_prism_minor()) +
+    labs(x = NULL, y = "Enamel / dentin density ratio", colour = NULL, fill = NULL,
+         title = title) +
+    theme_prism(base_size = 12) +
+    theme(legend.position = "top")
+  if (is.finite(erupt)) {
+    p <- p + geom_vline(xintercept = erupt, linetype = "longdash",
+                        colour = "#762A83", linewidth = 0.6)
+  }
+  p
+}
+
+# Attach the anatomy strip for the age of the groups plotted. `ages` is passed
+# explicitly by callers that already know it; otherwise derive it from groups.
+with_anatomy <- function(p, ages = NULL, groups = NULL) {
+  if (is.null(ages) && !is.null(groups)) ages <- age_of_groups(groups)
+  p / anat_strip(ages) + plot_layout(heights = c(3, 1.1))
+}
+
+# Per-specimen trace figure, used by each comparison section.
+sample_traces <- function(groups) {
+  smoothed |>
+    filter(group %in% groups, !is.na(ratio_med)) |>
+    droplevels() |>
+    ggplot(aes(z_percent, ratio_med, group = sample, colour = group)) +
+    geom_hline(yintercept = 1, linetype = "dashed", colour = "grey35") +
+    geom_line(linewidth = 0.8, alpha = 0.9) +
+    scale_colour_manual(values = group_cols) +
+    scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 20),
+                       guide = guide_prism_minor(), minor_breaks = seq(0, 100, 10)) +
+    labs(x = "Position along incisor (%)", y = "Enamel / dentin ratio", colour = NULL) +
+    theme_prism(base_size = 12) +
+    theme(legend.position = "top")
+}
+
+# Crossover + plateau for a set of groups.
+landmarks_of <- function(groups) {
+  trend_by_group |>
+    filter(group %in% groups) |>
+    group_by(group) |>
+    summarise(`crossover (z %)` = round(crossing_of(z_percent, fit), 1),
+              `plateau ratio`   = round(plateau_of(z_percent, fit), 3),
+              .groups = "drop")
+}
+```
+
+---
+
+## 8. The scans are comparable
+
+Before any group is compared with another, the scans have to be on a shared intensity footing. Two
+independent checks, neither of which depends on the incisor measurement itself.
+
+```{r scanner-check}
+molar_check <- map(json_files, function(path) {
+  j <- jsonlite::fromJSON(path)
+  m <- j$molar_cross_check
+  if (is.null(m)) return(NULL)
+  tibble(sample = j$sample,
+         `molar dentin`   = round(m$dentin, 1),
+         `molar enamel`   = round(m$enamel, 1),
+         `separation (σ)` = round(m$separation, 2),
+         `dentin anchor`  = round(j$anchor$mode, 1))
+}) |> list_rbind()
+
+profiles |>
+  group_by(group, sample) |>
+  summarise(`incisor dentin (median)` = round(median(dentin_reference, na.rm = TRUE), 1),
+            .groups = "drop") |>
+  left_join(molar_check, by = "sample") |>
+  arrange(group, sample)
+```
+
+The molar is fully mature in every animal regardless of group or age, so it must always separate
+strongly — a weak molar would mean distrust the scan, not the biology. **Note that the CFTR molars
+separate as well as wildtype molars.** The incisor phenotype in section 9 is therefore not a
+scan-quality artifact: the same scan resolves that animal's molar enamel normally.
+
+---
+
+## 9. P82 WT vs P82 CFTR cKO
+
+Age-matched and driver-matched: the only difference between these groups is the floxed *Cftr*
+allele.
+
+```{r fig-cftr, fig.height = 7.4, fig.cap = "Enamel/dentin density ratio, P82 wildtype (n = `r n_wt82`) against P82 CFTR cKO (n = `r n_cftr`), with anatomy on the shared axis. Bands are 95% cluster-bootstrap intervals over specimens. Dashed horizontal is dentin density; long-dashed vertical is the eruption plane."}
+cftr_groups <- c("WT P82", "CFTR cKO P82")
+with_anatomy(traj_panel(cftr_groups,
+                        "P82 wildtype vs CFTR conditional knockout"),
+             groups = cftr_groups)
+```
+
+```{r cftr-stats}
+cftr_tbl <- landmarks_of(c("WT P82", "CFTR cKO P82"))
+cftr_tbl
+```
+
+```{r cftr-prose, include = FALSE}
+pl_wt   <- cftr_tbl$`plateau ratio`[cftr_tbl$group == "WT P82"]
+pl_cf   <- cftr_tbl$`plateau ratio`[cftr_tbl$group == "CFTR cKO P82"]
+pct_def <- round(100 * (1 - pl_cf / pl_wt))
+```
+
+**The CFTR knockout never reaches wildtype enamel density anywhere along the tooth.** Its mature
+plateau is `r sprintf("%.2f", pl_cf)` against `r sprintf("%.2f", pl_wt)` in age-matched wildtype —
+a **`r pct_def` % deficit** in the enamel/dentin ratio. The knockout curve rises only just above
+dentin density, where wildtype reaches ~1.8×.
+
+### Per-specimen traces
+
+The group curve is only meaningful if every animal carries the effect:
+
+```{r fig-cftr-by-sample, fig.height = 5, fig.cap = "Per-specimen smoothed traces. Gaps are genuine: the rolling median is set to NA wherever its window would span unmeasurable slices, so no segment is drawn across a region with no data."}
+sample_traces(c("WT P82", "CFTR cKO P82"))
+```
+
+### Resolvability is itself the phenotype
+
+Section 3 established that `coincident` slices must not be forced to 1.0. Their **prevalence**, and
+the separation statistic behind it, is a direct readout of how distinguishable enamel is from dentin.
+
+`% pre-enamel` is reported beside it but answers a different question. It is the share of the tooth
+cervical to the enamel onset — where the pipeline found no enamel at all, rather than enamel it
+could not separate from dentin — so it measures how far along the incisor enamel deposition has
+got. Read the two together: a specimen can be low on one and high on the other, and only
+`% coincident` speaks to mineralization quality.
+
+```{r cftr-resolvability}
+profiles |>
+  filter(group %in% c("WT P82", "CFTR cKO P82")) |>
+  group_by(group, sample) |>
+  summarise(
+    `% coincident`   = round(100 * mean(status == "coincident"), 1),
+    `% pre-enamel`   = round(100 * mean(status == "pre_onset"), 1),
+    `% unresolvable` = round(100 * mean(status == "unresolvable"), 1),
+    `median separation (σ)` =
+      round(median(separation_sigma[status %in% c("resolved_hi", "resolved_lo")],
+                   na.rm = TRUE), 2),
+    .groups = "drop"
+  ) |>
+  arrange(group, sample)
+```
+
+Wildtype enamel sits ~6.8 σ from dentin; CFTR enamel sits ~2.7 σ away and collapses below the
+separation threshold on roughly a fifth of all slices. **The knockout's enamel is so
+hypomineralized that it is frequently indistinguishable from dentin** — which is why its ratio plot
+looks ragged, and why that raggedness is data rather than noise.
+
+---
+
+## 10. P52 WT vs P52 Hif1a cKO
+
+Age-matched and driver-matched: the only difference is the floxed *Hif1a* allele.
+
+```{r fig-hif, fig.height = 7.4, eval = has_hif, fig.cap = "Enamel/dentin density ratio, P52 wildtype (n = `r n_wt52`) against P52 Hif1a cKO (n = `r n_hif`)."}
+hif_groups <- c("WT P52", "Hif1a cKO P52")
+with_anatomy(traj_panel(hif_groups,
+                        "P52 wildtype vs Hif1a conditional knockout"),
+             groups = hif_groups)
+```
+
+```{r hif-stats, eval = has_hif}
+landmarks_of(c("WT P52", "Hif1a cKO P52"))
+```
+
+```{r fig-hif-by-sample, fig.height = 5, eval = has_hif, fig.cap = "Per-specimen smoothed traces, P52 groups."}
+sample_traces(c("WT P52", "Hif1a cKO P52"))
+```
+
+```{r hif-resolvability, eval = has_hif}
+profiles |>
+  filter(group %in% c("WT P52", "Hif1a cKO P52")) |>
+  group_by(group, sample) |>
+  summarise(
+    `% coincident`   = round(100 * mean(status == "coincident"), 1),
+    `% pre-enamel`   = round(100 * mean(status == "pre_onset"), 1),
+    `% unresolvable` = round(100 * mean(status == "unresolvable"), 1),
+    `median separation (σ)` =
+      round(median(separation_sigma[status %in% c("resolved_hi", "resolved_lo")],
+                   na.rm = TRUE), 2),
+    .groups = "drop"
+  ) |>
+  arrange(group, sample)
+```
+
+```{r hif-missing, eval = !has_hif, echo = FALSE, results = "asis"}
+cat("> **No Hif1a specimen has a density profile in the results directory.**\n",
+    "> Run `enamel_density.py` on the Hif1a reslices in the CMPR directory,\n",
+    "> then re-knit. This section is skipped rather than reported empty.\n")
+```
+
+> **`P52_Odam-Cre_Hifla-KO_1` is absent from this comparison.** It has a segmentation but no CMPR
+> resliced volume, so it falls outside the roster defined in section 1. The Hif1a group is
+> therefore n = `r n_hif`. Reslicing that specimen and re-running `enamel_density.py` would restore
+> it without any change to this report.
+
+---
+
+## 11. Age: P82 WT vs P52 WT
+
+Both wildtype, both Odam-Cre, 30 days apart. This sets the scale for reading the knockout
+comparisons: a genotype effect is only interesting if it exceeds what ordinary ageing does to the
+same measurement.
+
+```{r fig-age, fig.height = 7.4, fig.cap = "Enamel/dentin density ratio in wildtype at P52 (n = `r n_wt52`) and P82 (n = `r n_wt82`). Any displacement here is an age effect on a genotype-matched pair."}
+# Two ages on one axis, so there is no single anatomy frame: with_anatomy()
+# returns an empty strip here by design, and traj_panel() draws no eruption
+# line. The per-age eruption planes are tabulated below instead.
+with_anatomy(traj_panel(c("WT P52", "WT P82"), "Wildtype: P52 vs P82"),
+             groups = c("WT P52", "WT P82"))
+```
+
+```{r age-stats}
+landmarks_of(c("WT P52", "WT P82"))
+```
+
+```{r fig-age-by-sample, fig.height = 5, fig.cap = "Per-specimen smoothed traces for the two wildtype ages."}
+sample_traces(c("WT P52", "WT P82"))
+```
+
+### Putting the three contrasts on one scale
+
+The only way to read a genotype effect is against the age effect measured in the same units.
+
+```{r contrast-table}
+plateaus <- trend_by_group |>
+  group_by(group) |>
+  summarise(plateau = plateau_of(z_percent, fit), .groups = "drop")
+
+pget <- function(g) {
+  v <- plateaus$plateau[plateaus$group == g]
+  if (length(v) == 0) NA_real_ else v
+}
+
+tibble(
+  contrast  = c("Age: P82 WT − P52 WT",
+                "Genotype: CFTR cKO − P82 WT",
+                "Genotype: Hif1a cKO − P52 WT"),
+  reference = c(pget("WT P52"), pget("WT P82"), pget("WT P52")),
+  delta     = c(pget("WT P82")       - pget("WT P52"),
+                pget("CFTR cKO P82") - pget("WT P82"),
+                pget("Hif1a cKO P52") - pget("WT P52"))
+) |>
+  transmute(contrast,
+            `Δ plateau ratio` = round(delta, 3),
+            `% of reference`  = round(100 * delta / reference, 1))
+```
+
+**Read the genotype rows against the age row.** If ageing 30 days moves the plateau by a small
+fraction of what a knockout does, the knockout effect is not an age artifact.
+
+---
+
+## 12. The Odam-Cre wildtype development curve, by age
+
+The wildtype Odam-Cre specimens give the reference trajectory for this driver line — the curve any
+knockout is read against. **That reference is built separately at each age, not pooled.** Age is the
+largest source of variation in a developmental profile: the incisor lengthens and the whole
+mineralization sequence shifts along the `z_percent` axis between P52 and P82, so a curve averaged
+over the two ages passes through the middle of a real displacement and describes neither age. It
+would also be the wrong frame to read a knockout against, since each knockout is compared to its
+age-matched wildtype in §9 and §10. The anatomy strip beneath each curve is likewise the one for
+that age.
+
+```{r wt-pool}
+# One wildtype reference per age. Everything downstream -- landmarks, crossover,
+# plateau, the figure -- is derived inside this per-age fit, so no quantity here
+# is ever averaged across ages.
+wt_ages <- smoothed |>
+  filter(genotype == "WT", !is.na(ratio_med)) |>
+  pull(age) |> unique() |> sort()
+
+fit_wt_age <- function(a) {
+  d <- smoothed |> filter(genotype == "WT", age == a, !is.na(ratio_med))
+  # Coverage floor for this age's wildtype group only.
+  floor_a <- z_floor |> filter(group == paste("WT", a)) |> pull(z_min)
+  floor_a <- if (length(floor_a) == 0) NULL else max(floor_a)
+
+  trend <- fit_trend(d, "ratio_med", z_min = floor_a)
+  # Seeded per age so the band is reproducible regardless of which ages are run.
+  set.seed(7)
+  band  <- boot_trend(d, "ratio_med", z_min = floor_a)
+  trend |> left_join(band, by = "z_percent") |> mutate(age = a, .before = 1)
+}
+
+wt_trend_by_age <- map(wt_ages, fit_wt_age) |> list_rbind()
+
+# Interpolate the fitted ratio at an arbitrary z, within one age's curve.
+ratio_at_age <- function(a, z) {
+  d <- wt_trend_by_age |> filter(age == a)
+  if (!is.finite(z) || nrow(d) == 0 ||
+      z < min(d$z_percent) || z > max(d$z_percent)) return(NA_real_)
+  approx(d$z_percent, d$fit, xout = z)$y
+}
+
+wt_summary <- map(wt_ages, function(a) {
+  d     <- wt_trend_by_age |> filter(age == a)
+  cross <- crossing_of(d$z_percent, d$fit)
+  erupt <- erupt_at(a)
+  tibble(
+    age = a,
+    n_specimens = n_distinct(smoothed$sample[smoothed$genotype == "WT" &
+                                             smoothed$age == a]),
+    crossover = cross,
+    plateau   = plateau_of(d$z_percent, d$fit),
+    eruption  = erupt,
+    ratio_at_eruption = ratio_at_age(a, erupt),
+    erupt_minus_cross = erupt - cross
+  )
+}) |> list_rbind()
+
+wt_summary |>
+  transmute(
+    Age = age,
+    `Specimens`                             = n_specimens,
+    `Dentin-density crossover (z %)`        = sprintf("%.1f", crossover),
+    `Mature plateau ratio (z 70–95 %)`      = sprintf("%.3f", plateau),
+    `Eruption plane (z %)`                  = ifelse(is.na(eruption), "—",
+                                                     sprintf("%.1f", eruption)),
+    `Ratio at eruption`                     = ifelse(is.na(ratio_at_eruption), "—",
+                                                     sprintf("%.2f", ratio_at_eruption)),
+    `Eruption minus crossover (% length)`   = ifelse(is.na(erupt_minus_cross), "—",
+                                                     sprintf("%+.1f", erupt_minus_cross))
+  )
+```
+
+Each age's curve is drawn on its own, against its own anatomy.
+
+```{r fig-wt-development, fig.height = 7.8, fig.cap = "Odam-Cre wildtype enamel development curve at each age, fitted separately. Band is the 95% cluster bootstrap over the specimens of that age. Dotted vertical marks the dentin-density crossover, long-dashed the eruption plane. The lower panel of each figure is that age's anatomy; an age with no landmark picks yet gets an empty strip rather than the other age's frame."}
+wt_dev_plot <- function(a) {
+  d     <- wt_trend_by_age |> filter(age == a)
+  cross <- wt_summary$crossover[wt_summary$age == a]
+  erupt <- wt_summary$eruption[wt_summary$age == a]
+  ymin  <- min(d$fit, na.rm = TRUE)
+
+  p <- ggplot(d, aes(z_percent)) +
+    geom_hline(yintercept = 1, linetype = "dashed", colour = "grey35", linewidth = 0.5) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = "grey65", alpha = 0.35) +
+    geom_line(aes(y = fit), linewidth = 1.3, colour = "#2166AC") +
+    geom_vline(xintercept = cross, linetype = "dotted",
+               colour = "#E08214", linewidth = 0.8) +
+    annotate("text", x = cross, y = ymin, label = "crossover",
+             angle = 90, vjust = 1.3, hjust = 0, colour = "#E08214", size = 3.4) +
+    scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 20),
+                       guide = guide_prism_minor(), minor_breaks = seq(0, 100, 10)) +
+    scale_y_continuous(guide = guide_prism_minor()) +
+    labs(x = NULL, y = "Enamel / dentin density ratio",
+         title = sprintf("Odam-Cre wildtype enamel development — %s", a)) +
+    theme_prism(base_size = 12)
+
+  if (is.finite(erupt)) {
+    p <- p +
+      geom_vline(xintercept = erupt, linetype = "longdash",
+                 colour = "#762A83", linewidth = 0.7) +
+      annotate("text", x = erupt, y = ymin, label = "eruption",
+               angle = 90, vjust = -0.4, hjust = 0, colour = "#762A83", size = 3.4)
+  }
+  with_anatomy(p, ages = a)
+}
+
+for (a in wt_ages) print(wt_dev_plot(a))
+```
+
+```{r wt-dev-prose, include = FALSE}
+# Prose below is generated from the per-age fits rather than hard-coded, so it
+# cannot drift from the numbers when specimens or landmarks are added.
+has_erupt <- wt_summary |> filter(is.finite(eruption))
+
+intra_osseous <- if (nrow(has_erupt) > 0) {
+  paste(sprintf(
+    paste0("at **%s** the crossover sits at z = %.1f %% while the tooth does not emerge until ",
+           "z = %.1f %%, with the fitted ratio already %.2f at the eruption plane"),
+    has_erupt$age, has_erupt$crossover, has_erupt$eruption,
+    has_erupt$ratio_at_eruption), collapse = "; ")
+} else NA_character_
+
+# Age displacement, stated only when both ages are actually present.
+age_shift <- if (nrow(wt_summary) == 2) {
+  o <- wt_summary |> arrange(age)
+  sprintf("%.1f %% of length (%s: %.1f %%; %s: %.1f %%)",
+          abs(diff(o$crossover)), o$age[1], o$crossover[1], o$age[2], o$crossover[2])
+} else NA_character_
+
+plateau_shift <- if (nrow(wt_summary) == 2) {
+  o <- wt_summary |> arrange(age)
+  sprintf("%.3f (%s: %.3f; %s: %.3f)",
+          abs(diff(o$plateau)), o$age[1], o$plateau[1], o$age[2], o$plateau[2])
+} else NA_character_
+```
+
+```{r wt-dev-text, echo = FALSE, results = "asis"}
+if (!is.na(intra_osseous)) {
+  cat(sprintf(paste0(
+    "**Enamel reaches dentin density deep inside the bone, long before eruption.** In wildtype, ",
+    "%s. Essentially all of amelogenesis — secretory, crossover and the steep maturation climb — ",
+    "happens **intra-osseously**, on tissue never visible from outside the jaw. The consequence ",
+    "for study design is direct: a phenotype anywhere in those phases is invisible on an erupted ",
+    "or extracted crown, which is exactly where the CFTR deficit in section 9 lives.\n\n"),
+    intra_osseous))
+}
+
+if (!is.na(age_shift)) {
+  cat(sprintf(paste0(
+    "**The two ages are separated on this axis, which is why they are not pooled.** The ",
+    "crossover moves by %s between the two wildtype ages, and the mature plateau by %s. ",
+    "A single pooled curve would sit between the two and describe neither; each knockout in ",
+    "sections 9 and 10 is therefore read against the wildtype curve for its own age.\n"),
+    age_shift, plateau_shift))
+}
+```
+
+---
+
+## 13. All groups together
+
+```{r fig-all, fig.height = 7.8, fig.cap = "Every group on one axis. Orientation only: the valid contrasts are the age-matched pairs in sections 9-11, not any arbitrary pair of lines here."}
+all_groups <- levels(droplevels(trend_by_group$group))
+with_anatomy(traj_panel(all_groups, "All groups (orientation only)"),
+             groups = all_groups)
+```
+
+---
+
+## 14. Sensitivity
+
+Every headline number recomputed across the two tuning parameters that could plausibly drive it —
+the outlier threshold and the median window.
+
+```{r sensitivity, fig.height = 4.8, fig.cap = "Group plateau recomputed across outlier thresholds and median-window widths. Flat lines mean the landmark does not depend on the setting; what matters is that the groups keep their ordering and separation."}
+sens_grid <- expand_grid(thr = c(0.04, 0.06, 0.08, 0.12, 0.20),
+                         k   = c(11, 21, 31))
+
+sens <- pmap_dfr(sens_grid, function(thr, k) {
+  measured |>
+    group_by(sample) |>
+    group_modify(~ bind_cols(.x, flag_outliers(.x, threshold = thr))) |>
+    ungroup() |>
+    filter(!is_outlier) |>
+    arrange(sample, z) |>
+    group_by(sample) |>
+    mutate(rm = roll_med_gapped(enamel_ratio, z, k)) |>
+    ungroup() |>
+    filter(!is.na(rm)) |>
+    left_join(z_floor, by = "group") |>
+    group_by(group) |>
+    group_modify(function(d, key) {
+      tr <- fit_trend(d, "rm", z_min = d$z_min[1])
+      tibble(plateau   = plateau_of(tr$z_percent, tr$fit),
+             crossover = crossing_of(tr$z_percent, tr$fit))
+    }) |>
+    ungroup() |>
+    mutate(thr = thr, k = k)
+})
+
+ggplot(sens, aes(thr, plateau, colour = group, linetype = factor(k))) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.6) +
+  scale_colour_manual(values = group_cols) +
+  labs(x = "Outlier threshold (ratio units)", y = "Mature plateau ratio",
+       colour = NULL, linetype = "median k") +
+  theme_prism(base_size = 11) +
+  theme(legend.position = "right")
+```
+
+```{r sensitivity-table}
+sens |>
+  group_by(group) |>
+  summarise(`plateau min`         = round(min(plateau, na.rm = TRUE), 3),
+            `plateau max`         = round(max(plateau, na.rm = TRUE), 3),
+            `plateau range`       = round(max(plateau, na.rm = TRUE) -
+                                            min(plateau, na.rm = TRUE), 3),
+            `crossover range (%)` = round(max(crossover, na.rm = TRUE) -
+                                            min(crossover, na.rm = TRUE), 1),
+            .groups = "drop")
+```
+
+If the plateau range within a group is small against the between-group differences in section 11,
+no conclusion in this report depends on the tuning.
+
+### The `coincident` rule is the one choice that does matter
+
+Section 3 showed this directly. Unlike the outlier threshold and the median width, **this setting
+changes the CFTR curve materially**, which is why it is a named parameter with a documented default
+rather than a buried constant.
+
+---
+
+## 15. Export
+
+```{r export}
+out_dir <- file.path(params$figure_dir, "..", "exports")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+write_csv(trend_by_group, file.path(out_dir, "group_trends.csv"))
+
+# The wildtype development curve carries an `age` column and one fit per age;
+# it is no longer a single pooled curve, so anything reading this file must
+# group by age rather than assume one trajectory.
+write_csv(wt_trend_by_age, file.path(out_dir, "wt_development_curve.csv"))
+write_csv(wt_summary,      file.path(out_dir, "wt_development_summary_by_age.csv"))
+
+write_csv(
+  smoothed |> select(sample, group, genotype, age, z, z_percent, status,
+                     enamel_ratio, ratio_med, enamel_density, density_med),
+  file.path(out_dir, "per_slice_smoothed.csv")
+)
+if (nrow(anat) > 0) write_csv(anat, file.path(out_dir, "landmarks.csv"))
+# Per-age landmark consensus, the frame each figure is drawn against.
+if (nrow(anat_by_age) > 0)
+  write_csv(anat_by_age, file.path(out_dir, "landmark_consensus_by_age.csv"))
+
+tibble(file = list.files(out_dir)) |>
+  mutate(`size (KB)` = round(file.size(file.path(out_dir, file)) / 1024, 1))
+```
