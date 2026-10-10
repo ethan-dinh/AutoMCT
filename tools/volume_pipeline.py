@@ -66,7 +66,7 @@ import numpy as np
 import nrrd
 from rich.logging import RichHandler
 from numba import njit, prange
-from scipy.ndimage import affine_transform, gaussian_filter
+from scipy.ndimage import affine_transform, distance_transform_edt, gaussian_filter
 from scipy.ndimage import label as ndi_label
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import ConvexHull, QhullError
@@ -99,6 +99,11 @@ class PipelineOptions:
     autocrop: bool = False
     autocrop_margin_mm: float = 1.0
     autocrop_sample_dim: int = 192
+    # An explicit crop region, (z0, z1, y0, y1, x0, x1) as half-open source
+    # voxel indices. For a caller that already knows the box -- the studio UI
+    # draws it on a preview -- so no napari prompt is needed. Wins over both
+    # --crop and --autocrop.
+    crop_box: tuple[int, int, int, int, int, int] | None = None
     # Binning / downsampling
     target_voxel_um: float | None = None
     bin_method: str = "mean"
@@ -276,21 +281,109 @@ def select_crop_bbox(volume: np.ndarray) -> tuple[slice, slice, slice]:
     return z_slice, y_slice, x_slice
 
 
+# Mask pieces closer together than this count as one specimen when autocrop
+# picks the specimen out of the Otsu mask. Measured on f0004034, whose incisor
+# cut loose from the mandible 0.05 mm away: every value from 0.1 to 1.0 mm
+# recovers the same box, and on the other 14 RK-TGM2/UCSF scans grouping moves
+# the box by at most 0.3 mm, and mostly by one 0.1 mm subsample block or less.
+AUTOCROP_BRIDGE_MM = 0.3
+
+# Which autocrop cut a cached <stem>_prefiltered.nrrd, recorded in its
+# metadata. Bump this whenever autocrop can choose a different box for the same
+# settings: the resume cache is otherwise keyed on settings alone, so every
+# scan converted before the change would keep its old crop. Version 2 keeps an
+# incisor the threshold split from the mandible (see largest_specimen_group);
+# version 1, unrecorded, kept the largest component only.
+AUTOCROP_VERSION = 2
+
+
+def largest_specimen_group(
+    mask: np.ndarray,
+    spacing: np.ndarray | None = None,
+    bridge_mm: float = AUTOCROP_BRIDGE_MM,
+) -> tuple[np.ndarray, int]:
+    """The largest piece of a specimen mask, with the pieces clustered around it.
+
+    Keeping only the largest connected component is what drops the sample
+    holder and stray debris, but it drops any part of the specimen that the
+    threshold cut loose as well. On a mandible that is the incisor: at a
+    raw-scan Otsu level it separates from the bone across the periodontal
+    ligament, so it is a component of its own, and only the stretch of it that
+    happens to lie inside the bone's bounding box survives the crop. The
+    erupted tip, which reaches past the bone, is cut off (f0004034 lost ~1 mm
+    of it this way).
+
+    So the largest component is kept together with every piece clustered with
+    it -- pieces chained to it by gaps of at most *bridge_mm*. The grouping
+    only decides which pieces belong; the returned mask is their original
+    voxels, so it never grows the specimen itself. Debris and a holder farther
+    than *bridge_mm* from the specimen still drop out.
+
+    A detached piece of specimen lies inside the field of view, so if the
+    cluster reaches an edge of the array that the largest component alone does
+    not, it has picked up the tube wall instead, and the largest component is
+    kept alone. That happens when Otsu splits the out-of-view corners from a
+    fluid-filled tube rather than air from tissue: the fluid is then the
+    largest component, the wall is a broken ring hugging it, and adding the
+    ring widens the box to the full field of view (f0004038, whose
+    reorientation then fit a 15.3 mm box to an 11.7 mm specimen).
+
+    *spacing* is the mask's per-axis voxel size in mm; without it *bridge_mm*
+    is read in voxels. ``bridge_mm=0`` keeps the largest component alone.
+
+    Returns ``(mask, n_components)``, counting components before grouping.
+    """
+    labels, n_components = ndi_label(mask)
+    if n_components <= 1:
+        return mask, n_components
+    sizes = np.bincount(labels.ravel())
+    sizes[0] = 0
+    largest = labels == int(sizes.argmax())
+    if bridge_mm <= 0:
+        return largest, n_components
+
+    sampling = np.ones(mask.ndim) if spacing is None else np.asarray(spacing, dtype=float)
+    # Two pieces up to bridge_mm apart both come within half of it of the
+    # background voxels between them, so those voxels join them into one.
+    near = distance_transform_edt(~mask, sampling=sampling) <= bridge_mm / 2
+    groups, _ = ndi_label(near)
+    clustered = mask & (groups == groups[largest][0])
+
+    def faces(m: np.ndarray) -> np.ndarray:
+        return np.array([np.take(m, i, axis=a).any() for a in range(m.ndim) for i in (0, -1)])
+
+    if np.any(faces(clustered) & ~faces(largest)):
+        log.info(
+            "Specimen pieces within %.2f mm of the largest reach the edge of "
+            "the scan, so they are the holder -- keeping the largest alone.",
+            bridge_mm,
+        )
+        return largest, n_components
+    return clustered, n_components
+
+
 def autocrop_bbox(
     volume: np.ndarray,
     *,
     margin_mm: float = 1.0,
     spacing: np.ndarray | None = None,
     max_dim: int = 192,
+    bridge_mm: float = AUTOCROP_BRIDGE_MM,
 ) -> tuple[slice, slice, slice]:
     """Axis-aligned bounding box of the specimen, found without user input.
 
-    Same segmentation as the reorientation path uses: the volume is strided
-    down to at most *max_dim* voxels per axis, Otsu-thresholded to separate
-    specimen from air, and the largest connected component kept so the sample
-    holder, mounting putty and stray debris don't drag the box outward. The
-    component's extent is then padded by *margin_mm* and mapped back to
-    full-resolution indices.
+    The volume is strided down to at most *max_dim* voxels per axis and
+    Otsu-thresholded to separate specimen from air. The largest component and
+    the pieces within *bridge_mm* of it are kept (see
+    ``largest_specimen_group``), so the sample holder, mounting putty and
+    stray debris don't drag the box outward but an incisor the threshold
+    separated from the bone stays in. The cluster's extent is then padded by
+    *margin_mm* and mapped back to full-resolution indices.
+
+    This deliberately does not borrow the reorientation path's mask smoothing
+    (see ``_sample_object_points``): on an uncropped scan the blur collapses
+    the Otsu split into the noise band. Grouping works on the thresholded mask,
+    so the threshold is the same as before.
 
     This is the non-interactive counterpart to ``select_crop_bbox``. It differs
     from ``--reorient-tight`` in *when* and *in what frame* it crops: this runs
@@ -299,14 +392,16 @@ def autocrop_bbox(
     ``--reorient-tight`` crops in the rotated frame, after binning, and so
     tracks the specimen's own axes more tightly.
 
-    *spacing* is per-axis voxel size in mm (Z, Y, X), used only to convert
-    *margin_mm* into voxels; without it the margin is treated as voxels.
+    *spacing* is per-axis voxel size in mm (Z, Y, X), used to convert
+    *margin_mm* and *bridge_mm* into voxels; without it both are treated as
+    voxels.
 
     Returns ``(z_slice, y_slice, x_slice)`` for a (Z, Y, X) volume.
     """
     shape = np.array(volume.shape)
     steps = tuple(max(1, int(np.ceil(n / max_dim))) for n in volume.shape)
     sub = np.asarray(volume[::steps[0], ::steps[1], ::steps[2]], dtype=np.float32)
+    steps_arr = np.asarray(steps)
 
     threshold = float(threshold_otsu(sub))
     mask = sub > threshold
@@ -314,18 +409,16 @@ def autocrop_bbox(
         log.warning("Autocrop: Otsu selected no voxels — keeping the full volume.")
         return tuple(slice(0, int(n)) for n in shape)
 
-    labels, n_components = ndi_label(mask)
+    sub_spacing = steps_arr * (1.0 if spacing is None else np.asarray(spacing, dtype=float))
+    n_masked = int(mask.sum())
+    mask, n_components = largest_specimen_group(mask, sub_spacing, bridge_mm)
     if n_components > 1:
-        counts = np.bincount(labels.ravel())
-        counts[0] = 0
-        largest = int(counts.argmax())
+        kept = int(mask.sum())
         log.info(
-            "Autocrop: %d connected components — keeping the largest "
-            "(%d of %d masked voxels, %.1f%%).",
-            n_components, int(counts[largest]), int(mask.sum()),
-            100.0 * counts[largest] / float(mask.sum()),
+            "Autocrop: %d connected components — keeping the largest and "
+            "those within %.2f mm of it (%d of %d masked voxels, %.1f%%).",
+            n_components, bridge_mm, kept, n_masked, 100.0 * kept / n_masked,
         )
-        mask = labels == largest
 
     idx = np.argwhere(mask)
     lo_sub, hi_sub = idx.min(axis=0), idx.max(axis=0)
@@ -333,7 +426,6 @@ def autocrop_bbox(
     # Back to full-resolution indices. The stride means a masked sample at
     # sub-index i covers full indices [i*step, (i+1)*step), so the high edge
     # is expanded by one full step to cover the whole sampled block.
-    steps_arr = np.asarray(steps)
     lo = lo_sub * steps_arr
     hi = (hi_sub + 1) * steps_arr
 
@@ -350,13 +442,70 @@ def autocrop_bbox(
     hi = np.clip(np.ceil(hi).astype(int), lo + 1, shape)
 
     kept = float(np.prod(hi - lo)) / float(np.prod(shape))
+    # Plain ints: a handler may stringify numpy scalars (napari's test plugin
+    # does), and %d refuses a string.
     log.info(
         "Autocrop (Otsu threshold %.4g, margin %.2f mm) — Z: %d:%d, Y: %d:%d, "
         "X: %d:%d  (from %d×%d×%d, keeping %.1f%% of voxels)",
-        threshold, margin_mm, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2],
-        *shape, 100.0 * kept,
+        float(threshold), margin_mm, *(int(v) for pair in zip(lo, hi) for v in pair),
+        *(int(n) for n in shape), 100.0 * kept,
     )
     return slice(int(lo[0]), int(hi[0])), slice(int(lo[1]), int(hi[1])), slice(int(lo[2]), int(hi[2]))
+
+
+def parse_crop_box(text: str) -> tuple[int, int, int, int, int, int]:
+    """Parse ``Z0:Z1,Y0:Y1,X0:X1`` into a ``(z0, z1, y0, y1, x0, x1)`` tuple.
+
+    Ranges are half-open source voxel indices, the same convention as a numpy
+    slice, so ``0:100`` keeps voxels 0-99. Raises ``argparse.ArgumentTypeError``
+    so a malformed box is reported as a usage error rather than a traceback.
+    """
+    parts = [p.strip() for p in str(text).split(",")]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            f"crop box {text!r} needs three ranges, Z0:Z1,Y0:Y1,X0:X1"
+        )
+    bounds: list[int] = []
+    for axis, part in zip("ZYX", parts):
+        try:
+            start, stop = (int(v) for v in part.split(":"))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"crop box {axis} range {part!r} is not START:STOP"
+            ) from exc
+        if start < 0 or stop <= start:
+            raise argparse.ArgumentTypeError(
+                f"crop box {axis} range {part!r} is empty or negative"
+            )
+        bounds.extend((start, stop))
+    return tuple(bounds)  # type: ignore[return-value]
+
+
+def crop_box_slices(
+    box: tuple[int, int, int, int, int, int], shape: tuple[int, ...]
+) -> tuple[slice, slice, slice]:
+    """Clamp an explicit crop box to *shape* and return it as slices.
+
+    The box is drawn on a strided preview, so its far edge can land a block
+    past the array; clamping keeps that from being an error. A box that misses
+    the volume entirely is one, since cropping it would produce an empty array.
+    """
+    z0, z1, y0, y1, x0, x1 = (int(v) for v in box)
+    slices = []
+    for (start, stop), n, axis in zip(((z0, z1), (y0, y1), (x0, x1)), shape, "ZYX"):
+        start, stop = max(0, start), min(int(n), stop)
+        if stop <= start:
+            raise ValueError(
+                f"Crop box {axis} range {start}:{stop} lies outside the volume "
+                f"(axis length {n})"
+            )
+        slices.append(slice(start, stop))
+    log.info(
+        "Crop box — Z: %d:%d, Y: %d:%d, X: %d:%d  (from %d×%d×%d)",
+        slices[0].start, slices[0].stop, slices[1].start, slices[1].stop,
+        slices[2].start, slices[2].stop, *shape,
+    )
+    return slices[0], slices[1], slices[2]
 
 
 def _prompt_z_range(depth: int) -> tuple[int, int]:
@@ -1721,8 +1870,46 @@ def convert_volume(
     done_reorient = False
     cached_binning: dict | None = None
     cached_reorient: dict | None = None
+    # The explicit crop box baked into this run's output, recorded in the
+    # metadata so a later run can tell whether a cached prefiltered volume was
+    # cut to the box it is now being asked for.
+    applied_crop_box: list[int] | None = None
+    # Likewise the version of autocrop that cut it (see AUTOCROP_VERSION).
+    applied_autocrop_version: int | None = None
 
-    if prefiltered_path.exists():
+    reuse_prefiltered = prefiltered_path.exists()
+    if reuse_prefiltered and opts.crop_box is not None:
+        prior_box = None
+        if cached_meta_path.exists():
+            with open(cached_meta_path) as fh:
+                prior_box = (json.load(fh).get("_filter_params") or {}).get("crop_box")
+        if prior_box != list(opts.crop_box):
+            # Reusing it would silently keep the old region; the whole point of
+            # passing a box is to get that box.
+            log.info(
+                "Ignoring %s: it was cut to crop box %s, not the requested %s. "
+                "Re-reading the source.",
+                prefiltered_path.name, prior_box, list(opts.crop_box),
+            )
+            reuse_prefiltered = False
+    elif reuse_prefiltered and opts.autocrop and not opts.crop:
+        prior_version = None
+        if cached_meta_path.exists():
+            with open(cached_meta_path) as fh:
+                prior_version = (json.load(fh).get("_filter_params") or {}).get("autocrop_version")
+        if prior_version != AUTOCROP_VERSION:
+            # Same settings, but the crop they produce has changed since, and
+            # reusing the file would keep the old one -- the way an incisor
+            # tip cut off by version 1 stayed cut off after the fix.
+            log.info(
+                "Ignoring %s: it was not cut by the current autocrop (version %d; "
+                "its metadata records %s). Re-reading the source.",
+                prefiltered_path.name, AUTOCROP_VERSION,
+                f"version {prior_version}" if prior_version else "no version",
+            )
+            reuse_prefiltered = False
+
+    if reuse_prefiltered:
         # A previous --save-raw run already produced a cropped/binned/reoriented
         # but unfiltered volume. Reuse it so re-running with different filter
         # parameters doesn't require re-reading the source, re-selecting the
@@ -1747,6 +1934,8 @@ def convert_volume(
         if cached_meta_path.exists():
             with open(cached_meta_path) as fh:
                 prior = json.load(fh)
+            applied_crop_box = (prior.get("_filter_params") or {}).get("crop_box")
+            applied_autocrop_version = (prior.get("_filter_params") or {}).get("autocrop_version")
             cached_binning = prior.get("_binning") or None
             if cached_binning and tuple(cached_binning.get("factors_zyx") or ()) not in ((), (1, 1, 1)):
                 done_binning = True
@@ -1784,10 +1973,18 @@ def convert_volume(
         )
 
         # Optionally crop before anything else, so every downstream step runs
-        # on fewer voxels. --crop asks the user; --autocrop finds the specimen
-        # itself. An explicit --crop wins if somehow both are given.
+        # on fewer voxels. --crop-box states the region outright; --crop asks
+        # the user; --autocrop finds the specimen itself. They take precedence
+        # in that order.
         crop_slices = None
-        if opts.crop:
+        if opts.crop_box is not None:
+            crop_slices = crop_box_slices(opts.crop_box, volume.shape)
+            applied_crop_box = [
+                int(v) for s in crop_slices for v in (s.start, s.stop)
+            ]
+            if opts.crop or opts.autocrop:
+                log.info("--crop-box given, so --crop/--autocrop are ignored for this run.")
+        elif opts.crop:
             log.info("Opening napari for interactive crop selection…")
             crop_slices = select_crop_bbox(volume)
             if opts.autocrop:
@@ -1800,6 +1997,7 @@ def convert_volume(
                 spacing=spacing_from_directions(direction_matrix),
                 max_dim=opts.autocrop_sample_dim,
             )
+            applied_autocrop_version = AUTOCROP_VERSION
 
         if crop_slices is not None:
             z_sl, y_sl, x_sl = crop_slices
@@ -1943,11 +2141,17 @@ def convert_volume(
         "noise_floor_mode": (
             opts.noise_floor_mode if threshold_info is not None else None
         ),
-        "cropped": opts.crop or opts.autocrop or "prefiltered" in outputs,
-        "autocrop": opts.autocrop and not opts.crop,
-        "autocrop_margin_mm": (
-            opts.autocrop_margin_mm if opts.autocrop and not opts.crop else None
+        "cropped": (
+            opts.crop or opts.autocrop or applied_crop_box is not None
+            or "prefiltered" in outputs
         ),
+        "crop_box": applied_crop_box,
+        "autocrop": opts.autocrop and not opts.crop and opts.crop_box is None,
+        "autocrop_margin_mm": (
+            opts.autocrop_margin_mm
+            if opts.autocrop and not opts.crop and opts.crop_box is None else None
+        ),
+        "autocrop_version": applied_autocrop_version,
         "apply_rescale": opts.apply_rescale,
         "compression_level": opts.compression_level,
         "save_dtype": opts.save_dtype,
@@ -2005,11 +2209,20 @@ def add_pipeline_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--autocrop", action="store_true",
                    help="Crop to the specimen automatically, with no napari "
                         "prompt: the volume is Otsu-thresholded, the largest "
-                        "connected component kept (discarding holder and "
-                        "debris), and its axis-aligned bounding box plus "
+                        "connected component and the pieces within 0.3 mm of "
+                        "it kept (discarding holder and debris, but not an "
+                        "incisor the threshold split from the bone), and its "
+                        "axis-aligned bounding box plus "
                         "--autocrop-margin-mm taken. Runs before binning, so "
                         "every later stage works on the reduced volume. "
                         "Ignored when --crop is given")
+    p.add_argument("--crop-box", type=parse_crop_box, default=None,
+                   metavar="Z0:Z1,Y0:Y1,X0:X1",
+                   help="Crop to this region of the source volume before "
+                        "anything else runs, with no napari prompt. Half-open "
+                        "voxel indices in the source frame, like a numpy slice "
+                        "(0:100 keeps voxels 0-99). Wins over --crop and "
+                        "--autocrop")
     p.add_argument("--autocrop-margin-mm", type=float, default=1.0, metavar="MM",
                    help="Padding kept around the detected specimen with --autocrop")
     p.add_argument("--autocrop-sample-dim", type=int, default=192, metavar="N",
@@ -2268,6 +2481,7 @@ def options_from_args(
         autocrop=args.autocrop,
         autocrop_margin_mm=args.autocrop_margin_mm,
         autocrop_sample_dim=args.autocrop_sample_dim,
+        crop_box=args.crop_box,
         target_voxel_um=args.target_voxel_um,
         bin_method=args.bin_method,
         reorient=args.reorient,

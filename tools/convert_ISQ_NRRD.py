@@ -34,7 +34,9 @@ Output:
                               (optional, --save-raw)
     <stem>.nrrd          — the same volume, filtered, with geometry embedded
     <stem>_enhanced.nrrd — CLAHE-boosted viewing copy (optional, --enhance-contrast)
-    <stem>_meta.json     — ISQ header metadata
+    <stem>_meta.json     — ISQ header metadata, with the scanner's HA density
+                           calibration under "calibration" when the ISQ's
+                           extended header carries one (scanco_calibration.py)
 
 Notes:
     - The ISQ header is Scanco's proprietary binary format. This reader
@@ -139,6 +141,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scanco_calibration import read_isq_calibration  # noqa: E402
 from volume_pipeline import (  # noqa: E402  (needs the path insert above)
     PipelineOptions,
     add_pipeline_arguments,
@@ -296,6 +299,16 @@ def read_isq(path: Path) -> tuple[np.ndarray, dict]:
             )
 
     volume = flat.reshape(dim_z, dim_y, dim_x)
+
+    # The extended header carries the scanner's HA density calibration. Kept
+    # with the header, it reaches <stem>_meta.json, where the quantification
+    # tools look for it.
+    calibration = read_isq_calibration(path)
+    if calibration is not None:
+        header["calibration"] = calibration
+        log.info("HA calibration (%s): density = value / %d x %.4g + %.4g %s",
+                 calibration["description"] or "no description", calibration["mu_scaling"],
+                 calibration["slope"], calibration["intercept"], calibration["units"])
     return volume, header
 
 
