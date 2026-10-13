@@ -21,7 +21,8 @@ export const OVERLAY_COLORS = {
   // The molar step's teeth, in their landmark colours.
   m1: "#1aa34a", m2: "#9085e9", m3: "#d55181",
 };
-const LANDMARKS = [
+// The landmarks, in their colours on the dark stage (the compare page draws them too).
+export const LANDMARKS = [
   { name: "eruption", label: "Eruption", keys: ["q"], kind: "event", color: "#e8b400" },
   { name: "M1", label: "M1", keys: ["g", "h"], kind: "span", color: "#1aa34a" },
   { name: "M2", label: "M2", keys: ["j", "k"], kind: "span", color: "#9085e9" },

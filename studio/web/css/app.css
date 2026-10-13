@@ -685,6 +685,9 @@ ol.steps > li.disabled h3, ol.steps > li.disabled .step-summary { color: var(--i
 .c3d-legend b { color: var(--stage-ink); font-weight: 600; }
 .c3d-bar { display: block; flex: none; }
 .c3d-hint { color: var(--stage-ink-3); }
+.c3d-key { display: inline-flex; align-items: center; gap: 12px; }
+.c3d-key:empty { display: none; }
+.c3d-key-item { display: inline-flex; align-items: center; gap: 5px; color: var(--stage-ink); }
 .c3d-together { color: var(--stage-ink-2); font-size: 13px; }
 .c3d-empty { position: absolute; inset: 0; overflow: auto; padding: 28px; }
 .c3d-empty-in { max-width: 980px; }

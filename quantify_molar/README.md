@@ -53,6 +53,21 @@ mineral its core holds (see *Patches* below): stepped orange bands, counted
 patches at full colour and the rest of the judged enamel muted, what was not
 judged grey. `#mode=thin` or `#mode=low_density` opens it that way.
 
+**Measurement lines** draw the measurements themselves, to check what was
+measured: each line runs from the point the thickness is reported at (its
+thick end) to the point it reached, so its length is that point's thickness.
+*From the junction* shows the reported measurement, from the enamel–dentin
+junction to the outer surface; *from the outer surface* shows the one the
+outer surface is painted by. The file holds a random sample of up to 20,000
+lines per direction, spread evenly over the surface; the *Show* slider draws
+a leading share of them. Lines are plain yellow, or coloured by their
+thickness on the map's scale; a line that ends at a contact between teeth
+rather than at the air is pink. Turning them on fades the enamel so they can
+be seen inside it, and pointing at a line reads its length. A line that
+crosses dentin, skips a groove, or ends on the wrong face is a pairing to
+doubt. `#lines=junction` (or `outer`), `lines_share=50` and
+`line_colour=value` open the map that way.
+
 | Field | Meaning |
 |---|---|
 | `enamel.fraction` | Enamel voxels / molar voxels: the headline number |
@@ -61,10 +76,10 @@ judged grey. `#mode=thin` or `#mode=low_density` opens it that way.
 | `calibration` | The HA calibration used: slope, intercept, divisor, and the file it came from (null without one) |
 | `enamel_to_dentin_density` | Median enamel intensity / dentin histogram peak |
 | `enamel_minus_dentin` | The same contrast as a difference, for scales that do not start at zero |
-| `enamel.thickness_um` | Enamel thickness from the enamel-dentin junction: median, mean, percentiles, share of junction points measured, `junction_area_mm2`, per tooth, the same measured from the outer surface, and the intensity levels the surfaces were placed at |
+| `enamel.thickness_um` | Enamel thickness from the enamel-dentin junction: `median`, `mean` and `sd` (the sample standard deviation over the measured junction points), percentiles, share of junction points measured, `junction_area_mm2`, per tooth, the same measured from the outer surface, and the intensity levels the surfaces were placed at |
 | `enamel.thickness_um.edge_blur_um` | The scan's blur at the enamel's outer face, as a Gaussian sigma in µm, read off the scan |
 | `enamel.patches` | Patches of enamel thinner (`thin`) or less mineralized (`low_density`) than the enamel around them, for the row and per tooth: `share` (of the judged enamel-dentin junction under patches: the headline), `patches` and `patches_per_mm2`, mean `depth` (a share), `largest_mm2`, `shortfall` (the one-sided spread, no threshold), `share_judged`, `at_least` (the judged share past several thresholds), the largest patches with their centres in input voxels; the less dense ones also in mg HA/cm³ when calibrated, and the enamel's `core_density` |
-| `teeth[]` | The same per tooth, named M1-M3, with `thickness_median_um`, `junction_area_mm2`, `thickness_measured` and the patches (`thin_patch_share`, `low_density_patch_share`, ...), the crown's extent along the jaw (`crown_z_start`/`crown_z_end`) and the molar's landmark span (`landmark_z_start`/`landmark_z_end`, below) |
+| `teeth[]` | The same per tooth, named M1-M3, with `thickness_median_um`, `thickness_mean_um`, `thickness_sd_um`, `junction_area_mm2`, `thickness_mean_per_sqrt_junction` (the mean thickness over the square root of the junction's area, both in µm: a unitless proportion that stays the same for a tooth of the same shape at any size), `thickness_measured` and the patches (`thin_patch_share`, `low_density_patch_share`, ...), the crown's extent along the jaw (`crown_z_start`/`crown_z_end`) and the molar's landmark span (`landmark_z_start`/`landmark_z_end`, below) |
 | `teeth_split` | How the teeth were parted: `dentin-N`, their dentin cores standing apart after N voxels of erosion |
 | `contacts[]` | Each pair of neighbours (M1-M2, M2-M3): whether they touch, the area they share (`contact_area_mm2`), or the gap between them (`gap_um`) |
 | `enamel_mask` | How the enamel was found: `local-halfway` (between its two halfway faces), with the levels its junction (`junction_level`) and outer face (`outer_level`) were placed at along the tooth, the dentin under the enamel (`dentin_under_enamel`), the enamel's local peak (`enamel_peak`), each as median and 5th/95th percentile, and how many voxels of blurred outer rim it holds; or `threshold`, with the value |

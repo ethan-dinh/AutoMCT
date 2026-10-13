@@ -19,19 +19,26 @@
 // surface, cut into steps at round densities with their edges drawn, and read
 // against a reference density on the above/below scale; turning the shading
 // down keeps the light from moving colours off the scale.
+//
+// The landmarks (eruption, M1-M3) can be drawn as planes, each specimen's
+// own: a see-through sheet across its scan at the slice each was marked on, a
+// molar's at its start and its end, turning and moving with the specimen. The
+// marks sit in the segmented scan's slices, which the hemimandible, incisor,
+// molar and bone views are cut from; on the straightened incisor each is the
+// cross-section its mark maps to along the tooth.
 
 import { h, icon, replace, sig, numFmt, calibrationFormula, basename, ordinal } from "../lib.js";
 import { api, enc } from "../api.js";
 import { state, on, previewJob } from "../store.js";
 import { COLORMAPS, SEQUENTIAL, gradientCanvas, colorAt, RANDOM, MOST_COLOURS, stepPalette, stepsCanvas } from "../colormaps.js";
 import { loadVolume, histogramPercentile, tissueHistogram } from "../volume.js";
-import { Render3D } from "../render3d.js";
+import { Render3D, sliceAt } from "../render3d.js";
 import { register, identity } from "../pose.js";
 import { histWindow } from "../histwin.js";
 import { niceTicks } from "../charts.js";
 import { levelOrder, levelOf } from "../compare.js";
 import { toScale, fromScale, sharedWindow, gridColumns, rampPosition, stepWidth, stepChoices, stepsFor, randomSteps, stepColour } from "../scale.js";
-import { DEFAULT_CMAP, OVERLAY_COLORS } from "./viewer.js";
+import { DEFAULT_CMAP, OVERLAY_COLORS, LANDMARKS } from "./viewer.js";
 
 const MAX_PANELS = 4;
 const VIEW_ORDER = ["molar", "incisor", "cmpr", "mandible", "bone", "converted", "source"];
@@ -59,6 +66,12 @@ const ALT = MAC ? "Option" : "Alt";
 const ROLL = MAC ? "⌘" : "Ctrl";
 // How specimens are placed: turned and moved to fit the first, or as each sits in its scan.
 const ALIGNS = [["match", "Fitted to the first"], ["scan", "As scanned"]];
+// Where each view finds its landmarks: in the segmented scan's slices ("scan": the
+// marks), or along the straightened incisor ("cmpr": the slices they map to). The
+// raw and converted scans are not yet turned into that frame, so they have none.
+const LANDMARK_FRAME = { mandible: "scan", incisor: "scan", molar: "scan", bone: "scan", cmpr: "cmpr" };
+// How much a landmark's sheet covers what lies behind it: the default and the most.
+const SHEET = 0.2, MOST_SHEET = 0.6;
 
 const plain = (v) => sig(v, 5).replace(/,/g, "");
 // A length in mm as µm, as plainly as it reads: 0.006 -> "6", 0.0125 -> "12.5".
@@ -163,6 +176,10 @@ export async function mount(root, _params, query) {
     shade: Number.isFinite(saved.shade) ? Math.min(1, Math.max(0, saved.shade)) : 0.4,
     smooth: SMOOTHING.includes(saved.smooth) ? saved.smooth : 2,
     soften: SOFTEN.includes(saved.soften) ? saved.soften : 0,
+    // Landmarks as planes: shown or not, the ones turned off ({name: true}), and how much a sheet covers.
+    planes: saved.planes !== false,
+    lmOff: saved.lmOff && typeof saved.lmOff === "object" ? saved.lmOff : {},
+    sheet: Number.isFinite(saved.sheet) ? Math.min(MOST_SHEET, Math.max(0, saved.sheet)) : SHEET,
   };
   ui.fit = cmapIsDiverging(ui) ? "centre" : ui.view === "molar" ? "enamel" : "tissue";
   if (ui.cmap === RANDOM && ui.steps === "off") ui.steps = DEFAULT_STEPS;
@@ -178,7 +195,8 @@ export async function mount(root, _params, query) {
   const stage = h("div", { class: "c3d-stage" }, grid, empty);
   const bar = h("canvas", { class: "c3d-bar", "aria-hidden": "true" });
   const barNote = h("span", { class: "c3d-note" });
-  const legend = h("div", { class: "c3d-legend" }, bar, barNote, h("span", { class: "spacer" }),
+  const planeKey = h("span", { class: "c3d-note c3d-key" });
+  const legend = h("div", { class: "c3d-legend" }, bar, barNote, planeKey, h("span", { class: "spacer" }),
     h("span", { class: "c3d-hint" }, `Drag turns them all · Shift-drag moves · ${ROLL}-drag rolls · ${ALT} with any of them: one alone · Scroll zooms · Double-click resets`));
   const side = h("aside", { class: "side", "aria-label": "Display settings" });
   shell.append(h("div", { class: "stage-wrap" }, topbar, stage, legend), side);
@@ -229,7 +247,7 @@ export async function mount(root, _params, query) {
       "aria-label": `${name} in 3-D. Drag to turn every specimen, ${ALT}-drag to turn this one alone, Shift-drag to move, scroll to zoom.` });
     // adjusted: turned or moved alone by hand since it was lined up; fit: how it was lined up (pose.js).
     const p = { name, color: HUES.find((c) => !used.has(c)) || HUES[0], canvas, cap: h("div", { class: "c3d-cap" }),
-      msg: h("div", { class: "loading", hidden: true }), vol: null, cal: null, molar: null, token: 0,
+      msg: h("div", { class: "loading", hidden: true }), vol: null, cal: null, molar: null, marks: null, token: 0,
       adjusted: false, fit: null, reg: null };
     p.aloneBtn = h("button", { class: "btn small icon c3d-alone", "aria-pressed": "false", "aria-label": `Turn and move ${name} alone`,
       title: "Turn and move this one alone: drag turns it, Shift-drag moves it", onclick: () => setAlone(p, !p.r3d.alone) }, icon("move"));
@@ -262,7 +280,7 @@ export async function mount(root, _params, query) {
   async function openPanel(p) {
     const token = ++p.token, view = ui.view;
     const stale = () => token !== p.token || !panels.includes(p);
-    Object.assign(p, { vol: null, cal: null, molar: null, adjusted: false, fit: null, reg: null });
+    Object.assign(p, { vol: null, cal: null, molar: null, marks: null, adjusted: false, fit: null, reg: null });
     renderCaption(p);
     if (!p.r3d.ok) { show(p, p.r3d.error); return; }
     show(p, "Loading…");
@@ -276,13 +294,15 @@ export async function mount(root, _params, query) {
         if (!stale()) show(p, info.built ? "The preview is out of date; rebuilding it." : "Building the preview. Large scans take a minute.", 0);
         return;
       }
+      const marksAsked = LANDMARK_FRAME[view] ? fetchMarks(p.name) : null;
       const vol = await loadVolume(p.name, view);
       const molar = view === "molar" ? await api.get(`/api/samples/${enc(p.name)}/molar`).then((r) => r.summary, () => null) : null;
+      const marks = await marksAsked;
       if (stale()) return;
       p.r3d.setVolume(vol);
       // The renderer holds the voxels now: the page keeps only what it reads, so
       // four panels do not keep four scans' worth of arrays alive as well.
-      Object.assign(p, { vol: { meta: vol.meta, q: vol.q }, cal: vol.meta.calibration || null, molar });
+      Object.assign(p, { vol: { meta: vol.meta, q: vol.q }, cal: vol.meta.calibration || null, molar, marks });
       if (!fitted && ui.linked && cam) p.r3d.setCamera(cam);
     } catch (err) {
       if (!stale()) show(p, err.message || String(err));
@@ -290,6 +310,47 @@ export async function mount(root, _params, query) {
     }
     settle();
   }
+
+  // A specimen's landmarks: its marks, and what they map to (null: none to be had).
+  const fetchMarks = (name) => api.get(`/api/samples/${enc(name)}/marks`).catch(() => null);
+
+  // After the Landmarks step runs again, or marks are saved and mapped: the planes move.
+  async function reloadMarks(p) {
+    const token = p.token;
+    const marks = await fetchMarks(p.name);
+    if (token !== p.token || !panels.includes(p) || !p.vol) return;
+    p.marks = marks;
+    renderSide();
+    drawAll();
+  }
+
+  // A specimen's landmarks as planes in this view: [{lm, which, z, at}] -- which
+  // end of a molar ("" for an event), the slice, and the fraction of the way
+  // along the preview's long axis it sits (0 to 1 inside the preview's box).
+  function landmarkPlanes(p) {
+    const frame = LANDMARK_FRAME[ui.view];
+    if (!frame || !p.vol || !p.marks) return [];
+    const rows = frame === "scan"
+      ? (p.marks.marks || []).map((m) => [m.landmark, m.z_start, m.z_end])
+      : (p.marks.mapped || []).map((m) => [m.landmark, m.slice_start, m.slice_end]);
+    const out = [];
+    for (const [name, start, end] of rows) {
+      const lm = LANDMARKS.find((l) => l.name === name);
+      if (!lm) continue;
+      for (const [z, which] of [[start, end == null ? "" : "start"], [end, "end"]]) {
+        if (z == null) continue;
+        out.push({ lm, which, z, at: sliceAt(p.vol.meta, z) });
+      }
+    }
+    return out;
+  }
+  const inBox = (pl) => pl.at >= 0 && pl.at <= 1;
+  const planeOn = (pl) => ui.planes && !ui.lmOff[pl.lm.name];
+  // The landmarks drawn in any panel, in their order: what the legend names.
+  const drawnLandmarks = () => {
+    const drawn = shown().flatMap((p) => landmarkPlanes(p).filter((pl) => planeOn(pl) && inBox(pl)));
+    return LANDMARKS.filter((lm) => drawn.some((pl) => pl.lm === lm));
+  };
 
   // After a specimen arrives or leaves, or the scale changes: the window, the
   // camera and everything drawn from them follow.
@@ -438,6 +499,7 @@ export async function mount(root, _params, query) {
         style: ui.style, level: fromShared(p, ui.iso ?? ui.lo), lo: fromShared(p, ui.lo), hi: fromShared(p, ui.hi),
         gamma: ui.gamma, cmap: cmap(), cut: ui.cut, tint: ui.tint, deep, smooth, shade: ui.shade, steps: stepsFor(steps, calOf(p)), blur,
         overlays: p.vol.meta.overlays.map((o) => ({ on: Boolean(ui.structures[o.name]), color: OVERLAY_COLORS[o.name] || "#ffffff" })),
+        planes: landmarkPlanes(p).filter(planeOn).map((pl) => ({ at: pl.at, color: pl.lm.color })), sheet: ui.sheet,
       });
       p.r3d.render();
     }
@@ -453,7 +515,10 @@ export async function mount(root, _params, query) {
     const c = bar.getContext("2d");
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
     c.clearRect(0, 0, w, hgt);
-    if (!shown().length) { replace(barNote); return; }
+    if (!shown().length) { replace(barNote); replace(planeKey); return; }
+    const marked = drawnLandmarks();
+    replace(planeKey, marked.length ? ["Planes: ", marked.map((lm) => h("span", { class: "c3d-key-item" },
+      h("i", { class: "sw", style: { background: lm.color } }), lm.label))] : null);
     colorbar(c, 18, 2, w - 36, 10, scaleState(), colourOf, "#a3aeac", "10.5px system-ui, sans-serif");
     const steps = sharedSteps();
     replace(barNote, h("b", null, ui.scale === "mg" ? "mg HA/cm³" : "Raw intensity"),
@@ -514,7 +579,8 @@ export async function mount(root, _params, query) {
     const names = panels.map((p) => p.name);
     try {
       localStorage.setItem(storeKey(), JSON.stringify({ view: ui.view, names, scale: ui.scale, cmap: ui.cmap, style: ui.style,
-        linked: ui.linked, align: ui.align, steps: ui.steps, stepFill: ui.stepFill, seed: ui.seed, shade: ui.shade, smooth: ui.smooth, soften: ui.soften }));
+        linked: ui.linked, align: ui.align, steps: ui.steps, stepFill: ui.stepFill, seed: ui.seed, shade: ui.shade, smooth: ui.smooth, soften: ui.soften,
+        planes: ui.planes, lmOff: ui.lmOff, sheet: ui.sheet }));
     } catch { /* private window */ }
     // The address says what is compared, so it can be reloaded or sent on.
     const next = `#/compare?view=${enc(ui.view)}${names.length ? `&s=${names.map(enc).join(",")}` : ""}`;
@@ -697,7 +763,8 @@ export async function mount(root, _params, query) {
       return;
     }
     const list = shown();
-    replace(side, scaleSection(loaded), list.length ? heatSection(list) : null, list.length ? section3d(list) : null, specimensSection(loaded));
+    replace(side, scaleSection(loaded), list.length ? heatSection(list) : null, list.length ? section3d(list) : null,
+      list.length ? landmarksSection(list) : null, specimensSection(loaded));
     if (list.length) hist.set(histState());
     syncInputs();
   }
@@ -876,6 +943,43 @@ export async function mount(root, _params, query) {
         ` Hold ${ALT} (or press a panel's move button) and the same drags turn, move or roll that specimen alone.`));
   }
 
+  function landmarksSection(list) {
+    const frame = LANDMARK_FRAME[ui.view];
+    if (!frame) {
+      return h("section", null, h("h3", null, "Landmarks"),
+        h("div", { class: "lbl" }, `The landmarks sit in the segmented scan's slices. The ${(views[ui.view] || ui.view).toLowerCase()} view is not cut from it, so it shows none.`));
+    }
+    const each = list.map((p) => ({ p, planes: landmarkPlanes(p) }));
+    const found = LANDMARKS.filter((lm) => each.some((x) => x.planes.some((pl) => pl.lm === lm)));
+    const without = each.filter((x) => !x.planes.length).map((x) => x.p.name);
+    const outside = each.flatMap((x) => x.planes.filter((pl) => !inBox(pl))
+      .map((pl) => `${x.p.name}'s ${pl.lm.label}${pl.which ? ` ${pl.which}` : ""}`));
+    const missing = frame === "scan" ? "No landmarks yet" : "No landmarks mapped onto the straightened incisor yet";
+    const toggle = (lm, on) => { if (on) delete ui.lmOff[lm.name]; else ui.lmOff[lm.name] = true; remember(); drawAll(); };
+    const sheetVal = h("span", { class: "lbl num" }, `${Math.round(ui.sheet * 100)}%`);
+    if (!found.length) {
+      return h("section", null, h("h3", null, "Landmarks"),
+        h("div", { class: "lbl" }, `${missing} for ${list.length === 1 ? "this specimen" : "these specimens"}. The Landmarks step finds them; the viewer's Hemimandible view sets them by hand.`));
+    }
+    return h("section", null, h("h3", null, "Landmarks"),
+      h("label", { class: "check" }, h("input", { type: "checkbox", checked: ui.planes,
+        onchange: (e) => { ui.planes = e.target.checked; remember(); renderSide(); drawAll(); } }), "Show them as planes"),
+      ui.planes ? h("div", { class: "c3d-structs" }, found.map((lm) => h("label", { class: "check lbl" },
+        h("input", { type: "checkbox", checked: !ui.lmOff[lm.name], onchange: (e) => toggle(lm, e.target.checked) }),
+        h("i", { class: "sw", style: { background: lm.color } }), lm.kind === "span" ? `${lm.label}: where it starts and ends` : lm.label))) : null,
+      ui.planes ? h("div", { class: "row", style: { marginTop: "10px" } }, h("span", { class: "lbl" }, "Sheets"),
+        h("input", { type: "range", min: 0, max: MOST_SHEET, step: 0.05, value: ui.sheet, "aria-label": "How much each landmark's sheet covers",
+          title: "How much each plane's sheet covers what lies behind it. At none, only its rim and where it cuts the surface show.",
+          oninput: (e) => { ui.sheet = Number(e.target.value); sheetVal.textContent = `${Math.round(ui.sheet * 100)}%`; drawAll(); },
+          onchange: remember }),
+        sheetVal) : null,
+      h("div", { class: "lbl", style: { marginTop: "8px" } }, frame === "scan"
+        ? "Each specimen's own landmarks: a plane across its scan at the slice each was marked on, a molar's where it starts and where it ends. They turn and move with their specimen; a line in each one's colour shows where it cuts the surface. Tissue in front of a plane hides it."
+        : "Each specimen's own landmarks: a cross-section of the straightened incisor at the slice each one's mark maps to along the tooth, a molar's where it starts and where it ends."),
+      without.length ? h("div", { class: "lbl c3d-warn" }, `${missing}: ${without.join(", ")}.`) : null,
+      outside.length ? h("div", { class: "lbl c3d-warn" }, `Beyond the ends of this view's preview, so not drawn: ${outside.join(", ")}.`) : null);
+  }
+
   function specimensSection(loaded) {
     const res = new Set(loaded.map((p) => um(Math.min(...p.vol.meta.spacing_preview_mm))));
     return h("section", null, h("h3", null, "Specimens"),
@@ -959,6 +1063,21 @@ export async function mount(root, _params, query) {
       ui.style === "surface" ? (r ? `mean ${um(sharedDeep())}-${um(sharedDeep() + 2 * r)} µm beneath` : `${um(sharedDeep())} µm beneath`) : null,
       ui.soften ? `scan smoothed (sigma ${um(softenMm())} µm)` : null];
     c.fillText(note.filter(Boolean).join(", "), 48 * k + barW, rows * ch + 12 * k);
+    const marked = drawnLandmarks();
+    if (marked.length) {
+      let x = 48 * k + barW;
+      const y = rows * ch + 34 * k;
+      c.fillStyle = "#a3aeac";
+      c.fillText("Landmark planes:", x, y);
+      x += c.measureText("Landmark planes:").width + 10 * k;
+      for (const lm of marked) {
+        c.fillStyle = lm.color;
+        c.fillRect(x, y + 2.5 * k, 10 * k, 10 * k);
+        c.fillStyle = "#e2e9e7";
+        c.fillText(lm.label, x + 15 * k, y);
+        x += 15 * k + c.measureText(lm.label).width + 14 * k;
+      }
+    }
     out.toBlob((blob) => {
       const a = h("a", { href: URL.createObjectURL(blob), download: `compare_${ui.view}_${panels.map((p) => p.name).join("_")}.png` });
       document.body.appendChild(a);
@@ -987,6 +1106,11 @@ export async function mount(root, _params, query) {
   window.addEventListener("keydown", onKey);
 
   const offJobs = on("jobs", (job) => {
+    if (job?.step === "landmarks" && job.status === "done") {
+      const p = panels.find((x) => x.name === job.sample);
+      if (p && LANDMARK_FRAME[ui.view]) reloadMarks(p);
+      return;
+    }
     if (!job || job.step !== "preview" || job.params?.view !== ui.view) return;
     const p = panels.find((x) => x.name === job.sample);
     if (!p || p.vol) return;

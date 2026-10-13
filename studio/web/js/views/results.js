@@ -35,8 +35,9 @@ const GRID = Array.from({ length: 101 }, (_, i) => i);
 const dens = (v) => sig(v, 4);
 const finite = (v) => v != null && Number.isFinite(v);
 
-// The molar section's three cards and the switches each one has. Axis ticks
-// take as many decimals as their step needs ("0.09", not "0.0900").
+// The molar section's three cards and the switches each one has; the
+// incisor's plateau and peak take the density units too. Axis ticks take as
+// many decimals as their step needs ("0.09", not "0.0900").
 const ticked = (fy) => (v, step) => (step != null ? numFmt(v, step) : fy(v));
 const sig3 = ticked((v) => sig(v, 3));
 const dens4 = ticked(dens);
@@ -49,9 +50,13 @@ const VOLUME_MEASURES = {
   total: { label: "Whole tooth", yLabel: "Volume (mm³)", fy: sig3 },
 };
 const THICKNESS_MEASURES = {
-  thickness: { label: "Thickness", yLabel: "Enamel thickness, median (µm)", fy: sig3 },
+  thickness: { label: "Median", yLabel: "Enamel thickness, median (µm)", fy: sig3 },
+  mean: { label: "Mean", yLabel: "Enamel thickness, mean (µm)", fy: sig3 },
+  sd: { label: "SD", yLabel: "Enamel thickness, SD across the junction (µm)", fy: sig3 },
   junction: { label: "Junction area", yLabel: "Enamel–dentin junction area (mm²)", fy: sig3 },
   perArea: { label: "Thickness ÷ area", yLabel: "Thickness ÷ junction area (µm/mm²)", fy: sig3 },
+  // Mean thickness over the junction's linear size, √area, both in µm: a pure number, shown as a percentage.
+  perSqrt: { label: "Mean ÷ √area", yLabel: "Mean thickness ÷ √junction area (%)", fy: pctFmt, share: true },
 };
 // Patches of enamel thinner, or less dense, than the enamel around them on the
 // same tooth (quantify_molar/enamel_patches.py): shares are of the judged
@@ -80,7 +85,7 @@ function fmtP(p) {
 // What the page remembers per workspace: how it compares, not what it hides.
 // What it hides lasts as long as the browser tab (below), so opening a
 // specimen and coming back keeps it, and a new session shows every specimen.
-const VIEW_KEYS = ["by", "k", "specimens", "landmarks", "units", "dentin",
+const VIEW_KEYS = ["by", "k", "specimens", "landmarks", "units", "dentin", "plateauUnits", "peakUnits",
   "molarDensity", "densityStat", "volumeMeasure", "volumeTooth", "thicknessMeasure", "thicknessTooth",
   "patchMeasure", "patchTooth"];
 const viewKey = () => `studio.results:${state.app?.workspace?.root || ""}`;
@@ -138,11 +143,12 @@ async function resultsPage(root, scopeId, query) {
     specimens: true, k: 21, landmarks: true,
     molarDensity: null, densityStat: "mean", volumeMeasure: "share", volumeTooth: "all",
     thicknessMeasure: "thickness", thicknessTooth: "all", patchMeasure: "thinShare", patchTooth: "all",
-    by: null, units: null, dentin: true, moreTests: false,
+    by: null, units: null, dentin: true, plateauUnits: "ratio", peakUnits: "ratio", moreTests: false,
     ...Object.fromEntries(VIEW_KEYS.filter((k) => saved[k] !== undefined).map((k) => [k, saved[k]])),
   };
   // A remembered switch the page no longer offers falls back to the default.
   if (!DENSITY_UNITS.some(([k]) => k === ui.molarDensity)) ui.molarDensity = null;
+  for (const key of ["plateauUnits", "peakUnits"]) if (!DENSITY_UNITS.some(([k]) => k === ui[key])) ui[key] = "ratio";
   if (!DENSITY_STATS.includes(ui.densityStat)) ui.densityStat = "mean";
   if (!VOLUME_MEASURES[ui.volumeMeasure]) ui.volumeMeasure = "share";
   if (!THICKNESS_MEASURES[ui.thicknessMeasure]) ui.thicknessMeasure = "thickness";
@@ -760,11 +766,13 @@ async function resultsPage(root, scopeId, query) {
     // ---- Thickness: only once Molar enamel has measured it.
     const thick = (n, which) => {
       if (which === "all") {
-        return { thickness: m(n).thickness_um, junction: m(n).junction_area_mm2, perArea: m(n).thickness_um_per_mm2,
+        return { thickness: m(n).thickness_um, mean: m(n).thickness_mean_um, sd: m(n).thickness_sd_um,
+          junction: m(n).junction_area_mm2, perArea: m(n).thickness_um_per_mm2, perSqrt: m(n).thickness_mean_per_sqrt_junction,
           p25: m(n).thickness_p25_um, p75: m(n).thickness_p75_um };
       }
       const t = tooth(n, which);
-      return t ? { thickness: t.thickness_um, junction: t.junction_area_mm2, perArea: t.thickness_um_per_mm2 } : {};
+      return t ? { thickness: t.thickness_um, mean: t.thickness_mean_um, sd: t.thickness_sd_um,
+        junction: t.junction_area_mm2, perArea: t.thickness_um_per_mm2, perSqrt: t.thickness_mean_per_sqrt_junction } : {};
     };
     const measured = shown.some((n) => m(n).thickness_um != null);
     let thicknessCard = null;
@@ -779,8 +787,11 @@ async function resultsPage(root, scopeId, query) {
       thicknessCard = measureCard({
         title: "Enamel thickness",
         sub: { thickness: `median across the enamel, ${teethText}`,
+          mean: `mean across the enamel, ${teethText}`,
+          sd: `standard deviation of the thickness across the enamel's own junction points, ${teethText}: how uneven each specimen's enamel is`,
           junction: `the area where enamel meets dentin, ${teethText}`,
-          perArea: `median thickness divided by the area where enamel meets dentin, ${teethText}` }[measure],
+          perArea: `median thickness divided by the area where enamel meets dentin, ${teethText}`,
+          perSqrt: `mean thickness as a share of the junction's linear size (the square root of its area), ${teethText}` }[measure],
         names,
         controls: [
           switcher("Thickness measured", Object.entries(THICKNESS_MEASURES).map(([k, d]) => [k, d.label, !known(k)]),
@@ -790,14 +801,21 @@ async function resultsPage(root, scopeId, query) {
         valueOf: (n) => thick(n, tTooth)[measure],
         yLabel: tm.yLabel, fy: tm.fy,
         columns: [{ key: "thickness", label: "Median (µm)", numeric: true, format: fmt(sig3) },
+          { key: "mean", label: "Mean (µm)", numeric: true, format: fmt(sig3) },
+          { key: "sd", label: "SD (µm)", numeric: true, format: fmt(sig3) },
           ...(tTooth === "all" ? [{ key: "p25", label: "25th percentile (µm)", numeric: true, format: fmt(sig3) },
             { key: "p75", label: "75th percentile (µm)", numeric: true, format: fmt(sig3) }] : []),
           { key: "junction", label: "Junction area (mm²)", numeric: true, format: fmt(sig3) },
-          { key: "perArea", label: "Thickness ÷ area (µm/mm²)", numeric: true, format: fmt(sig3) }],
+          { key: "perArea", label: "Thickness ÷ area (µm/mm²)", numeric: true, format: fmt(sig3) },
+          { key: "perSqrt", label: "Mean ÷ √area", numeric: true, format: fmt((v) => fmtPct(v, 2)) }],
         rowOf: (n) => thick(n, tTooth),
         empty: `No thickness measured${tTooth === "all" ? "" : ` for ${tTooth}`} in the specimens shown. Run Molar enamel again to measure it.`,
         extra: measure === "perArea" ? noteLine("The ratio still depends on tooth size: area grows with the square of size and thickness "
-          + "only in proportion, so a tooth of the same shape but 10% smaller reads 11% higher.") : null,
+          + "only in proportion, so a tooth of the same shape but 10% smaller reads 11% higher. Mean ÷ √area does not.")
+          : measure === "perSqrt" ? noteLine("Both in µm, so the ratio has no unit: a tooth of the same shape at any size reads the same, "
+            + "and a higher value is thicker enamel for the size of its junction."
+            + (tTooth === "all" ? " For the row, √area is of the three junctions together, which is not one tooth's size: "
+              + "compare M1, M2 or M3 alone for the per-tooth proportion." : "")) : null,
         exportKey: "molar-thickness", exportAs: () => thicknessMeasure(measure, tTooth),
       });
     }
@@ -859,9 +877,11 @@ async function resultsPage(root, scopeId, query) {
       return { title, yLabel: title, valueOf: (n) => patchOf(n, t)[spec.key], scale: spec.share ? 100 : 1 };
     };
     const thicknessMeasure = (k, t) => {
-      const title = { thickness: `${toothName(t)} enamel thickness, median (µm)`, junction: `${toothName(t)} enamel–dentin junction area (mm²)`,
-        perArea: `${toothName(t)} enamel thickness ÷ junction area (µm/mm²)` }[k];
-      return { title, yLabel: title, valueOf: (n) => thick(n, t)[k] };
+      const title = { thickness: `${toothName(t)} enamel thickness, median (µm)`, mean: `${toothName(t)} enamel thickness, mean (µm)`,
+        sd: `${toothName(t)} enamel thickness, SD (µm)`, junction: `${toothName(t)} enamel–dentin junction area (mm²)`,
+        perArea: `${toothName(t)} enamel thickness ÷ junction area (µm/mm²)`,
+        perSqrt: `${toothName(t)} mean enamel thickness ÷ √junction area (%)` }[k];
+      return { title, yLabel: title, valueOf: (n) => thick(n, t)[k], scale: THICKNESS_MEASURES[k].share ? 100 : 1 };
     };
     for (const u of ["mgHA", "raw"]) for (const st of DENSITY_STATS) offerColumn(names, densityMeasure(u, st));
     offerColumn(names, densityMeasure("ratio"));
@@ -1123,20 +1143,73 @@ async function resultsPage(root, scopeId, query) {
     const metrics = data.incisor_metrics;
     const metricNames = included(Object.keys(metrics).filter(inProject), "incisor");
     const fy3 = (v) => sig(v, 3);
-    const metricCards = [
-      ["crossover_z", "Where enamel overtakes dentin", "where the ratio last rises through 1.0 and stays above", "Crosses 1.0 at (% along)",
-        "Incisor crossover, where enamel overtakes dentin (% along)"],
-      ["plateau_ratio", "Mature plateau", "mean ratio 70–95% along the tooth", "Mean enamel/dentin ratio, 70–95%",
-        "Incisor mature plateau, enamel/dentin ratio 70–95% along"],
-      ["peak_ratio", "Peak mineralization", "highest ratio along the tooth", "Peak enamel/dentin ratio", "Incisor peak enamel/dentin ratio"],
-    ].map(([key, title, sub, yLabel, exportTitle]) => {
-      const valueOf = (n) => metrics[n]?.[key];
-      const measure = { title: exportTitle, yLabel, valueOf };
-      offerColumn(metricNames, measure);
-      const s = strip(valueOf, metricNames, { yLabel, fy: fy3 });
-      return s ? chartCard({ ...titled(`incisor-${key}`, title), sub, chart: s.chart, extra: statsBlock(valueOf, metricNames, fy3),
-        onExport: offerFigure(`incisor-${key}`, title, () => columnSpec(metricNames, measure)) }) : null;
-    }).filter(Boolean);
+    const crossover = { title: "Incisor crossover, where enamel overtakes dentin (% along)", yLabel: "Crosses 1.0 at (% along)",
+      valueOf: (n) => metrics[n]?.crossover_z };
+    offerColumn(metricNames, crossover);
+    const crossoverStrip = strip(crossover.valueOf, metricNames, { yLabel: crossover.yLabel, fy: fy3 });
+    const crossoverCard = crossoverStrip ? chartCard({ ...titled("incisor-crossover_z", "Where enamel overtakes dentin"),
+      sub: "where the ratio last rises through 1.0 and stays above", chart: crossoverStrip.chart,
+      extra: statsBlock(crossover.valueOf, metricNames, fy3),
+      onExport: offerFigure("incisor-crossover_z", "Where enamel overtakes dentin", () => columnSpec(metricNames, crossover)) }) : null;
+
+    // The plateau and the peak in any of the three units: the enamel's running
+    // median converted with the scan's HA calibration or as stored, or the ratio.
+    const shownMetrics = pool(metricNames).map((s) => s.name);
+    const anyCalibrated = shownMetrics.some((n) => metrics[n]?.plateau_mgHA != null || metrics[n]?.peak_mgHA != null);
+    const fmt = (fy) => (v) => (v == null || !Number.isFinite(v) ? "–" : fy(v));
+    const metricMeasure = (key, u) => {
+      const what = key === "plateau" ? "mature plateau" : "peak";
+      const along = key === "plateau" ? ", 70–95% along" : "";
+      if (u === "ratio") {
+        return { title: key === "plateau" ? "Incisor mature plateau, enamel/dentin ratio 70–95% along" : "Incisor peak enamel/dentin ratio",
+          valueOf: (n) => metrics[n]?.[`${key}_ratio`],
+          yLabel: key === "plateau" ? "Mean enamel/dentin ratio, 70–95%" : "Peak enamel/dentin ratio" };
+      }
+      const unit = u === "mgHA" ? "mg HA/cm³" : "raw";
+      const quantity = u === "mgHA" ? "density" : "intensity";
+      return { title: `Incisor ${what}, enamel ${quantity}${along} (${unit})`, valueOf: (n) => metrics[n]?.[`${key}_${u}`],
+        yLabel: `${key === "plateau" ? "Plateau" : "Peak"} enamel ${quantity} (${unit})` };
+    };
+    const metricCard = (key, title, uiKey) => {
+      const units = ui[uiKey];
+      const measure = metricMeasure(key, units);
+      const fy = units === "ratio" ? sig3 : dens4;
+      const cardKey = `incisor-${key}_ratio`;  // the key the card's renamed title is kept under
+      const s = strip(measure.valueOf, metricNames, { yLabel: measure.yLabel, fy });
+      const read = key === "plateau" ? "mean 70–95% along the tooth" : "highest along the tooth";
+      const sub = { ratio: `enamel/dentin ratio, ${read}`, mgHA: `enamel density, ${read}, converted with each scan's HA calibration`,
+        raw: `enamel intensity, ${read}, as stored in the scan` }[units];
+      const missing = units === "mgHA" ? shownMetrics.filter((n) => metrics[n]?.[`${key}_ratio`] != null && metrics[n]?.[`${key}_mgHA`] == null) : [];
+      const notes = [];
+      if (missing.length && anyCalibrated) notes.push(`Not shown, with no HA calibration: ${missing.join(", ")}. Raw intensity and the enamel/dentin ratio include them.`);
+      if (units === "raw") notes.push("Raw values are comparable only between scans made with one scanner setting and calibration.");
+      // Every unit side by side, with the ratio's denominator: the dentin reference.
+      const columns = [
+        { key: "mgHA", label: "mg HA/cm³", numeric: true, format: fmt(dens) },
+        { key: "raw", label: "Raw", numeric: true, format: fmt(dens) },
+        { key: "ratio", label: "Enamel/dentin", numeric: true, format: fmt(sig3) },
+        { key: "dentin_mgHA", label: "Dentin, mg HA/cm³", numeric: true, format: fmt(dens) },
+        { key: "dentin_raw", label: "Dentin, raw", numeric: true, format: fmt(dens) },
+      ];
+      const rowOf = (n) => ({ mgHA: metrics[n]?.[`${key}_mgHA`], raw: metrics[n]?.[`${key}_raw`], ratio: metrics[n]?.[`${key}_ratio`],
+        dentin_mgHA: metrics[n]?.dentin_mgHA, dentin_raw: metrics[n]?.dentin_raw });
+      return chartCard({
+        ...titled(cardKey, title), sub,
+        controls: switcher(`${title} units`, DENSITY_UNITS, units, (v) => { ui[uiKey] = v; }),
+        chart: s ? s.chart : h("div", { class: "empty" }, h("span", null, units === "mgHA"
+          ? "No HA calibration for these scans. The converter copies it from a Scanco ISQ; for other scans, enter it in the Molar enamel step's Density calibration settings. Raw intensity shows every specimen."
+          : "No measured curve in the specimens shown.")),
+        table: s ? () => specimenTable(metricNames, columns, rowOf) : null,
+        extra: s || notes.length ? h("div", null, s ? statsBlock(measure.valueOf, metricNames, fy) : null,
+          notes.length ? noteLine(notes.join(" ")) : null) : null,
+        onExport: s ? offerFigure(cardKey, title, () => columnSpec(metricNames, metricMeasure(key, units))) : null,
+      });
+    };
+    for (const key of ["plateau", "peak"]) for (const [u] of DENSITY_UNITS) offerColumn(metricNames, metricMeasure(key, u));
+    const anyMetric = shownMetrics.some((n) => metrics[n]?.plateau_ratio != null || metrics[n]?.peak_ratio != null);
+    const metricCards = [crossoverCard,
+      anyMetric ? metricCard("plateau", "Mature plateau", "plateauUnits") : null,
+      anyMetric ? metricCard("peak", "Peak mineralization", "peakUnits") : null].filter(Boolean);
     return h("section", { class: "section" },
       h("div", { class: "section-head" }, h("h2", null, "Incisor mineralization"),
         h("span", { class: "sub" }, "Along the tooth from the cervical loop, cleaned as the R report cleans it: slices that pass its quality filters, "

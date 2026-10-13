@@ -333,9 +333,13 @@ export async function mount(root, [name]) {
             sm.thickness_p25_um != null
               ? `median, enamel–dentin junction to outer surface; middle half ${sig(sm.thickness_p25_um, 3)}–${sig(sm.thickness_p75_um, 3)} µm`
               : "median, by the earlier method: run Molar enamel again to update it"),
+          sm.thickness_mean_um != null ? tile("Mean thickness", sig(sm.thickness_mean_um, 3), " µm",
+            sm.thickness_sd_um != null ? `± ${sig(sm.thickness_sd_um, 3)} µm SD across the junction's points` : "across the junction's points") : null,
           sm.junction_area_mm2 != null ? tile("Enamel–dentin junction", sig(sm.junction_area_mm2, 3), " mm²", "surface area") : null,
           sm.thickness_um_per_mm2 != null ? tile("Thickness ÷ junction area", sig(sm.thickness_um_per_mm2, 3), " µm/mm²",
-            "median thickness divided by the junction's area") : null),
+            "median thickness divided by the junction's area") : null,
+          sm.thickness_mean_per_sqrt_junction != null ? tile("Mean thickness ÷ √junction area", fmtPct(sm.thickness_mean_per_sqrt_junction, 2), null,
+            "both in µm: the enamel's mean thickness as a share of the junction's linear size") : null),
         // Patches of enamel thinner, or less dense, than the enamel around them (summaries from version 6).
         sm.thin_patch_share != null ? tileGroup("Patches",
           tile("Thin patches", fmtPct(sm.thin_patch_share, 2), null,
@@ -359,10 +363,15 @@ export async function mount(root, [name]) {
             { key: "volume_mm3", label: "Tooth mm³", numeric: true, format: (v) => sig(v, 3) },
             ...(teeth.some((t) => t.thickness_um != null)
               ? [{ key: "thickness_um", label: "Thickness µm", numeric: true, format: (v) => (v == null ? "–" : sig(v, 3)) }] : []),
+            ...(teeth.some((t) => t.thickness_mean_um != null)
+              ? [{ key: "thickness_mean_um", label: "Mean µm", numeric: true, format: (v) => (v == null ? "–" : sig(v, 3)) },
+                { key: "thickness_sd_um", label: "SD µm", numeric: true, format: (v) => (v == null ? "–" : sig(v, 3)) }] : []),
             ...(teeth.some((t) => t.junction_area_mm2 != null)
               ? [{ key: "junction_area_mm2", label: "Junction mm²", numeric: true, format: (v) => (v == null ? "–" : sig(v, 3)) }] : []),
             ...(teeth.some((t) => t.thickness_um_per_mm2 != null)
               ? [{ key: "thickness_um_per_mm2", label: "Thickness ÷ area µm/mm²", numeric: true, format: (v) => (v == null ? "–" : sig(v, 3)) }] : []),
+            ...(teeth.some((t) => t.thickness_mean_per_sqrt_junction != null)
+              ? [{ key: "thickness_mean_per_sqrt_junction", label: "Mean ÷ √area", numeric: true, format: (v) => (v == null ? "–" : fmtPct(v, 2)) }] : []),
             ...(teeth.some((t) => t.thin_patch_share != null)
               ? [{ key: "thin_patch_share", label: "Thin patches", numeric: true, format: (v) => fmtPct(v, 2) }] : []),
             ...(teeth.some((t) => t.low_density_patch_share != null)
@@ -443,13 +452,20 @@ export async function mount(root, [name]) {
         h("a", { class: "btn small", href: `#/viewer/${enc(name)}/cmpr` }, icon("viewer"), "View straightened incisor")),
       prof.stale ? h("div", { class: "notice warning", style: { marginBottom: "10px" } },
         "This profile was written by an older build of Incisor enamel, before its current handling of where enamel starts, so it can open high and drop. Run Incisor enamel again.") : null,
-      h("div", { class: "tiles" },
-        tile("Ratio crosses 1.0 at", m.crossover_z != null ? sig(m.crossover_z, 3) : "–", m.crossover_z != null ? "%" : "",
-          "where it last rises through dentin density, from the cervical loop"),
-        tile("Mature plateau", m.plateau_ratio != null ? sig(m.plateau_ratio, 3) : "–", null, "mean ratio 70–95% along the tooth"),
-        tile("Peak enamel/dentin ratio", m.peak_ratio != null ? sig(m.peak_ratio, 3) : "–"),
-        tile("Slices kept", (m.kept_slices ?? 0).toLocaleString(), null,
-          `of ${prof.z.length.toLocaleString()}${left.length ? `; ${left.join(" and ")} left out` : ""}`)),
+      // The plateau and the peak each in mg HA/cm³, as stored and as the ratio, as the molar's density tiles are.
+      h("div", { class: "tile-groups" },
+        tileGroup("Along the tooth",
+          tile("Ratio crosses 1.0 at", m.crossover_z != null ? sig(m.crossover_z, 3) : "–", m.crossover_z != null ? "%" : "",
+            "where it last rises through dentin density, from the cervical loop"),
+          tile("Slices kept", (m.kept_slices ?? 0).toLocaleString(), null,
+            `of ${prof.z.length.toLocaleString()}${left.length ? `; ${left.join(" and ")} left out` : ""}`)),
+        ...[["plateau", "Mature plateau", "mean 70–95% along the tooth"], ["peak", "Peak mineralization", "highest along the tooth"]]
+          .map(([key, label, read]) => tileGroup(label,
+            tile("Enamel density", m[`${key}_mgHA`] != null ? sig(m[`${key}_mgHA`], 4) : "–", m[`${key}_mgHA`] != null ? " mg HA/cm³" : null,
+              incisor.calibration ? `${read}; dentin reference ${m.dentin_mgHA != null ? sig(m.dentin_mgHA, 4) : "–"}` : "no HA calibration for this scan"),
+            tile("Enamel intensity", m[`${key}_raw`] != null ? sig(m[`${key}_raw`], 4) : "–", null,
+              `raw, ${read}; dentin reference ${m.dentin_raw != null ? sig(m.dentin_raw, 4) : "–"}`),
+            tile("Enamel/dentin ratio", m[`${key}_ratio`] != null ? sig(m[`${key}_ratio`], 3) : "–", null, read)))),
       h("div", { style: { marginTop: "14px" } }, chartCard({
         title: "Mineralization along the tooth",
         sub: "enamel/dentin density ratio, cervical loop (0%) to tip (100%), cleaned as the R report cleans it",

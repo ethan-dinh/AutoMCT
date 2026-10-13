@@ -17,6 +17,10 @@
 // -- (z, y, x) array order and the flipped y -- make it a true, unmirrored
 // picture of the scan.
 //
+// Landmarks can be drawn as planes square to the long axis (the compare
+// page): each a see-through sheet across the box with its rim drawn, hidden
+// where tissue stands in front of it, and a line where it meets the surface.
+//
 // The camera turns freely, all the way round in any direction (a trackball:
 // dragging turns about the screen's own axes, Ctrl- or ⌘-drag rolls), about
 // the tissue's centre rather than the box's (pose.js).
@@ -32,6 +36,7 @@ import { identity, matMul, transpose, apply, axisAngle, orthonormal, tissueCloud
 
 const FOV = 30 * Math.PI / 180;
 const MAX_LABELS = 8;
+const MAX_PLANES = 8;
 // Named sides as [yaw, pitch]: turned about the vertical, then tipped towards the top.
 const VIEWS = { side: [0, 0.15], top: [0, Math.PI / 2], other: [Math.PI, 0.15], bottom: [0, -Math.PI / 2], end: [Math.PI / 2, 0.15] };
 // Radians per pixel dragged.
@@ -68,6 +73,14 @@ uniform int uStyle, uSteps;
 uniform vec3 uLabelColor[${MAX_LABELS}];
 uniform float uLabelOn[${MAX_LABELS}];
 uniform vec3 uStage;
+// Landmark planes, square to the long axis: each at x = uPlaneX[k] in the box's
+// frame. uSheet: how much a sheet covers what is behind it; uPixel: the
+// world size of one CSS pixel per unit of distance from the eye; uDpr: device
+// pixels per CSS pixel.
+uniform int uPlanes;
+uniform float uPlaneX[${MAX_PLANES}];
+uniform vec3 uPlaneColor[${MAX_PLANES}];
+uniform float uSheet, uPixel, uDpr;
 out vec4 outColor;
 
 vec3 toTex(vec3 w) { return vec3(w.z / uExtent.z + 0.5, 0.5 - w.y / uExtent.y, w.x / uExtent.x + 0.5); }
@@ -109,6 +122,31 @@ float beneath(vec3 p, vec3 inward) {
   return n > 0.0 ? sum / n : at(p);
 }
 
+// The landmark planes the ray crosses between tFront and tBack, over col,
+// farthest first: each a see-through sheet with its rim -- where it meets the
+// box's sides -- drawn about a pixel and a half wide.
+vec3 sheets(vec3 col, vec3 ro, vec3 rd, float tFront, float tBack) {
+  vec3 halfSize = 0.5 * uExtent;
+  float drawn = 1e30;
+  for (int n = 0; n < ${MAX_PLANES}; n++) {
+    float far = -1.0;
+    int k = -1;
+    for (int i = 0; i < ${MAX_PLANES}; i++) {
+      if (i >= uPlanes) break;
+      // Parallel to the ray, this is infinite (or NaN) and fails every test.
+      float tp = (uPlaneX[i] - ro.x) / rd.x;
+      if (tp >= tFront && tp <= tBack && tp < drawn && tp > far) { far = tp; k = i; }
+    }
+    if (k < 0) break;
+    drawn = far;
+    vec3 q = ro + rd * far;
+    float px = far * uPixel;
+    float rim = 1.0 - smoothstep(0.75 * px, 1.75 * px, min(halfSize.y - abs(q.y), halfSize.z - abs(q.z)));
+    col = mix(col, uPlaneColor[k], max(uSheet, 0.9 * rim));
+  }
+  return col;
+}
+
 void main() {
   vec3 rd = normalize(uForward + vNdc.x * uTanHalf * uAspect * uRight + vNdc.y * uTanHalf * uUp);
   vec3 ro = uEye;
@@ -131,7 +169,8 @@ void main() {
       m = max(m, at(ro + rd * t));
       t += uStep;
     }
-    outColor = vec4(!inBox || m <= uLo || m < uFloor ? uStage : cmap(m), 1.0);
+    vec3 xray = !inBox || m <= uLo || m < uFloor ? uStage : cmap(m);
+    outColor = vec4(uPlanes > 0 ? sheets(xray, ro, rd, max(tEnter, tCut), tExit) : xray, 1.0);
     return;
   }
 
@@ -199,6 +238,25 @@ void main() {
     float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
     col = mix(col, lum > 0.42 ? vec3(0.04, 0.06, 0.07) : vec3(0.9, 0.93, 0.92), 0.65 * line);
   }
+  if (uPlanes > 0) {
+    // Where a plane meets the surface: a line in its colour, about two pixels
+    // wide whatever the surface's slope (capped, so a silhouette's far
+    // neighbours do not smear it), on a dark edge so it reads on any colour of
+    // the scale. Then the sheets in front of the surface.
+    float hx = (ro + rd * (hit ? t : tExit)).x;
+    float px = (hit ? t : tExit) * uPixel;
+    float fx = clamp(fwidth(hx) * uDpr, 1e-6, 8.0 * px);
+    if (hit) {
+      vec3 p = ro + rd * t;
+      for (int i = 0; i < ${MAX_PLANES}; i++) {
+        if (i >= uPlanes) break;
+        float d = abs(p.x - uPlaneX[i]);
+        col = mix(col, vec3(0.03, 0.04, 0.05), 0.55 * (1.0 - smoothstep(1.4 * fx, 2.2 * fx, d)));
+        col = mix(col, uPlaneColor[i], 1.0 - smoothstep(0.6 * fx, 1.2 * fx, d));
+      }
+    }
+    col = sheets(col, ro, rd, max(tEnter, tCut), hit ? t : tExit);
+  }
   outColor = vec4(col, 1.0);
 }`;
 
@@ -258,6 +316,11 @@ function orientation(name) {
   return matMul(axisAngle([0, 1, 0], yaw), axisAngle([1, 0, 0], -pitch));
 }
 
+// Where a full-resolution slice's middle lies along a preview's axis 0, as the
+// fraction of the way across its box -- what a plane's `at` takes. The inverse
+// of volume.js's fullZ: preview slice i spans its box from i / Z to (i + 1) / Z.
+export const sliceAt = (meta, z) => (z + 0.5 - meta.crop[0][0]) / (meta.factors[0] * meta.shape[0]);
+
 const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
 const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -284,9 +347,11 @@ export class Render3D {
     // origin + k x width, each step one colour (fill) and its edges drawn (lines);
     // with a palette ([r, g, b] 0..255 each: the random scale), step k takes its
     // colour k mod its length -- or null;
-    // blur: the scan smoothed in 3-D before anything is read from it, a Gaussian's sigma in mm (0: as scanned).
+    // blur: the scan smoothed in 3-D before anything is read from it, a Gaussian's sigma in mm (0: as scanned);
+    // planes: landmarks as planes square to the long axis, [{at, color}] -- `at` the fraction of the
+    // way along the box's axis 0, 0 to 1 -- and sheet: how much each plane's sheet covers, 0 to 1.
     this.opts = { style: "surface", level: 0, lo: 0, hi: 1, gamma: 1, cmap: "gray", overlays: [], cut: 0, tint: 0.7,
-      deep: null, smooth: 0, shade: 1, steps: null, blur: 0 };
+      deep: null, smooth: 0, shade: 1, steps: null, blur: 0, planes: [], sheet: 0.2 };
     this.volumeKey = null;
     this.moving = false;
     this.onChange = null;
@@ -330,7 +395,7 @@ export class Render3D {
     for (const name of ["uVol", "uLab", "uCmap", "uEye", "uRight", "uUp", "uForward", "uTanHalf", "uAspect", "uExtent",
       "uTexel", "uStep", "uLevel", "uLo", "uHi", "uInvGamma", "uCut", "uTint", "uDeep", "uStyle", "uSteps", "uLabelColor",
       "uLabelOn", "uStage", "uFloor", "uShade", "uAvg", "uStepOrigin", "uStepWidth", "uStepFill", "uLines",
-      "uColours", "uPalette", "uBelow", "uAbove"])
+      "uColours", "uPalette", "uBelow", "uAbove", "uPlanes", "uPlaneX", "uPlaneColor", "uSheet", "uPixel", "uDpr"])
       this.loc[name] = gl.getUniformLocation(p, name);
     this.vao = gl.createVertexArray();
     gl.bindVertexArray(this.vao);
@@ -773,6 +838,14 @@ export class Render3D {
     o.overlays.slice(0, MAX_LABELS).forEach((ov, k) => { colors.set(hexRgb(ov.color), k * 3); on[k] = ov.on ? 1 : 0; });
     gl.uniform3fv(L.uLabelColor, colors); gl.uniform1fv(L.uLabelOn, on);
     gl.uniform3fv(L.uStage, hexRgb("#0e1213"));
+    const planes = (o.planes || []).filter((pl) => pl.at >= 0 && pl.at <= 1).slice(0, MAX_PLANES);
+    const px = new Float32Array(MAX_PLANES), pc = new Float32Array(MAX_PLANES * 3);
+    planes.forEach((pl, k) => { px[k] = (pl.at - 0.5) * this.extent[0]; pc.set(hexRgb(pl.color), k * 3); });
+    gl.uniform1i(L.uPlanes, planes.length);
+    gl.uniform1fv(L.uPlaneX, px); gl.uniform3fv(L.uPlaneColor, pc);
+    gl.uniform1f(L.uSheet, clamp(o.sheet ?? 0.2, 0, 1));
+    gl.uniform1f(L.uPixel, 2 * Math.tan(FOV / 2) / Math.max(c.clientHeight, 1));
+    gl.uniform1f(L.uDpr, h / Math.max(c.clientHeight, 1));
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.bindVertexArray(null);

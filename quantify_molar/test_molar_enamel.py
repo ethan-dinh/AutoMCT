@@ -328,6 +328,10 @@ def test_thickness_is_the_shell_thickness():
     summary, _ = M.quantify(volume, SPACING, scan=scan, fixed_threshold=MIDWAY, split=False)
     thickness = summary["enamel"]["thickness_um"]
     assert thickness["median"] == pytest.approx(60.0, abs=3.0)
+    # A shell of one thickness: the mean sits with the median and the spread is a voxel or two.
+    assert thickness["mean"] == pytest.approx(60.0, abs=3.0)
+    assert 0.0 < thickness["sd"] < 2.0 * SPACING[0] * 1000
+    assert thickness["from_outer_surface"]["sd"] is not None
     assert thickness["share_measured"] > 0.95
     assert thickness["levels"]["background_from"] == "scan"
     assert thickness["levels"]["background"] == pytest.approx(AIR, abs=3 * NOISE)
@@ -363,6 +367,10 @@ def test_thickness_per_tooth():
     summary, _ = M.quantify(volume, SPACING, scan=volume)
     by_name = {t["name"]: t["thickness_median_um"] for t in summary["teeth"]}
     assert by_name["M1"] > by_name["M2"] > by_name["M3"]
+    for t in summary["teeth"]:
+        assert t["thickness_mean_um"] > 0 and t["thickness_sd_um"] >= 0
+        assert t["thickness_mean_per_sqrt_junction"] == pytest.approx(
+            t["thickness_mean_um"] / (np.sqrt(t["junction_area_mm2"]) * 1000.0))
     for (_, _, cap), name in zip(TEETH, ("M1", "M2", "M3")):
         assert by_name[name] <= cap * 10.0 + 3.0
     # Each cap's underside is a flat junction, 2 half-widths across by the tooth's length. Where it
@@ -394,12 +402,66 @@ def test_the_thickness_map_is_written_and_readable(tmp_path):
     assert "__DATA__" not in page and "__META__" not in page and "__SAMPLE__" not in page
     meta = json.loads(re.search(r'<script id="meta" type="application/json">(.*?)</script>', page, re.S).group(1))
     assert meta["vmax"] == 90.0 and meta["reported"]["median"] == pytest.approx(60.0, abs=3.0)
+    assert meta["reported"]["mean"] == pytest.approx(60.0, abs=3.0) and meta["reported"]["sd"] > 0
+    assert meta["per_tooth"] == [] or "sd" in meta["per_tooth"][0]
     assert meta["layout"]["layers"]["enamel"]["n_faces"] > 0 and meta["layout"]["layers"]["dentin"]["n_faces"] > 0
     assert meta["reported"]["junction_area_mm2"] > 0
+    # The measurement lines ride along, a sample of each direction's pairings, for the viewer to draw.
+    for which in ("junction", "outer"):
+        lines = meta["layout"]["lines"][which]
+        assert 0 < lines["n"] <= lines["n_measured"] and lines["n"] <= S._DISPLAY_LINES
+    assert meta["layout"]["lines"]["junction"]["n_measured"] == pytest.approx(
+        meta["reported"]["n_points"], rel=0.01)
+    assert 'id="lines"' in page
 
     row = M.summary_row("P22_WT_1", record)
     assert row["thickness_median_um"] == pytest.approx(60.0, abs=3.0) and row["junction_area_mm2"] > 0
+    assert row["thickness_mean_um"] == pytest.approx(60.0, abs=3.0) and row["thickness_sd_um"] > 0
+    assert row["thickness_mean_per_sqrt_junction"] == pytest.approx(
+        row["thickness_mean_um"] / (np.sqrt(row["junction_area_mm2"]) * 1000.0))
     assert row["thickness_background_from"] == "scan"
+
+
+def test_thickness_stats_give_the_mean_and_sample_sd():
+    stats = S.thickness_stats(np.array([1.0, 2.0, 3.0, np.nan]))
+    assert stats["mean"] == pytest.approx(2.0) and stats["sd"] == pytest.approx(1.0) and stats["n_points"] == 3
+    assert S.thickness_stats(np.array([5.0, np.nan]))["sd"] is None
+    assert S.thickness_stats(np.array([np.nan]))["mean"] is None
+
+
+def test_the_measurement_lines_are_a_spread_sample_packed_as_the_viewer_reads_them():
+    """At most the limit, drawn at random without repeats, in a random order; contacts flagged."""
+    src = np.stack([np.arange(100.0), np.zeros(100), np.zeros(100)], axis=1)
+    dst = np.stack([np.arange(100.0), np.full(100, 6.0), np.zeros(100)], axis=1)
+    partner = np.arange(100)
+    partner[::10] = -1                                  # unmeasured
+    thickness = np.full(100, 36.0)
+    thickness[5] = np.nan
+    to_contact = np.zeros(100, dtype=bool)
+    to_contact[::7] = True
+    frame = lambda v: np.asarray(v, dtype=np.float32) * 2.0  # noqa: E731
+    lines = S._measurement_lines(src, dst, partner, thickness, frame, to_contact=to_contact, limit=40)
+    assert lines["n"] == 40 and lines["n_measured"] == 89
+    assert (lines["end"] - lines["start"] == [0.0, 12.0, 0.0]).all()
+    assert len(np.unique(lines["start"][:, 0])) == 40 and not np.all(np.diff(lines["start"][:, 0]) > 0)
+    kept = (lines["start"][:, 0] / 2).astype(int)
+    assert (lines["to_contact"] == to_contact[kept]).all() and 5 not in kept and 10 not in kept
+    everything = S._measurement_lines(src, dst, partner, thickness, frame, limit=1000)
+    assert everything["n"] == everything["n_measured"] == 89
+
+    layers = {"enamel": {"pos": np.array([[0, 0, 0], [200.0, 12.0, 0]], dtype=np.float32),
+                         "faces": np.array([[0, 1, 1]], dtype=np.uint32)}}
+    blob, layout = S._pack(layers, {"junction": lines})
+    spec = layout["lines"]["junction"]
+    assert spec["n"] == 40 and spec["n_measured"] == 89
+    for key in ("start", "end", "value", "to_contact"):
+        assert spec[key] % 4 == 0
+    lo, scale = np.array(layout["bbox_min"]), np.array(layout["scale"])
+    start = lo + np.frombuffer(blob, "<u2", 40 * 3, spec["start"]).reshape(-1, 3) * scale
+    end = lo + np.frombuffer(blob, "<u2", 40 * 3, spec["end"]).reshape(-1, 3) * scale
+    assert np.allclose(start, lines["start"], atol=0.01) and np.allclose(end, lines["end"], atol=0.01)
+    assert set(np.frombuffer(blob, "<u2", 40, spec["value"])) == {360}
+    assert (np.frombuffer(blob, "u1", 40, spec["to_contact"]) == lines["to_contact"]).all()
 
 
 def test_the_map_data_decodes_as_the_viewer_reads_it():
@@ -1109,7 +1171,7 @@ def test_the_patches_reach_the_csv_the_map_and_the_saved_points(tmp_path):
     out = tmp_path / "out"
     assert M.main(["-i", str(sample), "-o", str(out), "--no-split", "--save-points", "--no-plot"]) == 0
     record = json.loads((out / "P22_WT_9_molar_enamel.json").read_text())
-    assert record["version"] == M.VERSION == 6
+    assert record["version"] == M.VERSION == 7
     row = M.summary_row("P22_WT_9", record)
     assert row["thin_patch_share"] == pytest.approx(record["enamel"]["patches"]["thin"]["share"])
     assert row["low_density_patch_share"] > 0 and row["edge_blur_um"] > 0

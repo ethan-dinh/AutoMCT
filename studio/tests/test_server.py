@@ -208,6 +208,9 @@ def test_the_landmarks_step_finds_them_and_keeps_hand_marks(server):
     assert [(a["landmark"], a["z_start"], a["z_end"]) for a in marks["auto"] if a["landmark"] != "eruption"] == [
         (f"M{k}", z0, z1) for k, (z0, z1) in enumerate(((96.0, 127.0), (131.0, 151.0), (155.0, 167.0)), start=1)]
     assert {m["landmark"] for m in marks["mapped"]} == {"eruption", "M1", "M2", "M3"}
+    # Each with the straightened incisor's slices it maps to: where the compare page draws it there.
+    assert all(m["slice_start"] is not None and (m["slice_end"] is not None) == (m["kind"] == "span")
+               for m in marks["mapped"])
     assert {m["source"] for m in marks["mapped"] if m["landmark"] in ("eruption", "M2")} == {"manual"}
 
     # Saving from the viewer maps the marks as they are, without finding them again.

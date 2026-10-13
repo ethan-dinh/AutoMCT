@@ -213,3 +213,15 @@ def test_random_steps_colour_the_same_densities_alike_in_every_specimen():
         for shader, legend in specimen:
             assert shader == legend
     assert {str(s) for s in got} == {str(got[0])}
+
+
+def test_a_landmark_plane_sits_in_the_middle_of_its_slice_in_any_preview():
+    """A full-resolution slice lands in the middle of the preview slice that holds it, cropped and block-averaged alike."""
+    meta = {"crop": [[5, 160], [0, 90], [0, 72]], "factors": [2, 2, 2], "shape": [78, 45, 36]}
+    # volume.js's fullZ: the middle of the full-resolution slices preview slice i averages.
+    got = js("ids.map((i) => R.sliceAt(meta, meta.crop[0][0] + (i + 0.5) * meta.factors[0] - 0.5))",
+             meta=meta, ids=[0, 1, 40, 77])
+    assert got == pytest.approx([(i + 0.5) / 78 for i in (0, 1, 40, 77)])
+    # The box's ends: before the crop's first slice, or past the last block (78 of 2 hold 156 slices), it is outside.
+    ends = js("[R.sliceAt(meta, 5), R.sliceAt(meta, 4), R.sliceAt(meta, 160), R.sliceAt(meta, 161)]", meta=meta)
+    assert 0 < ends[0] < 1 / 78 and ends[1] < 0 and 77 / 78 < ends[2] < 1 and ends[3] > 1

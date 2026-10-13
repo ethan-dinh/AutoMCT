@@ -177,6 +177,49 @@ def test_the_thickness_is_also_given_per_mm2_of_junction(ws, tmp_path):
     assert results.gather(ws)["molar"][old]["thickness_um_per_mm2"] is None
 
 
+def test_the_thickness_mean_and_sd_reach_results_and_the_export(ws, tmp_path):
+    name = specimen(ws, tmp_path, "P22_TGM2_WT_F_15")["name"]
+    summary = write_molar(tmp_path / "data" / name, name,
+                          thickness={"median": 63.0, "mean": 65.5, "sd": 11.25, "p25": 50.0, "p75": 75.0},
+                          teeth=[("M1", 66.0, 2.4), ("M2", 60.0, 1.6)],
+                          tooth_patches={"M1": {"thickness_mean_um": 68.0, "thickness_sd_um": 9.5}})
+    ws.set_artifacts(name, {"molar_quant": str(summary)})
+    mq = results.gather(ws)["molar"][name]
+    assert mq["thickness_mean_um"] == 65.5 and mq["thickness_sd_um"] == 11.25
+    assert [(t["thickness_mean_um"], t["thickness_sd_um"]) for t in mq["teeth"]] == [(68.0, 9.5), (None, None)]
+    row = next(csv.DictReader(io.StringIO(results.export(ws, "molar")[1])))
+    assert float(row["thickness_mean_um"]) == 65.5 and float(row["thickness_sd_um"]) == 11.25
+    assert float(row["M1_thickness_mean_um"]) == 68.0 and float(row["M1_thickness_sd_um"]) == 9.5
+    assert row["M2_thickness_mean_um"] == "" and row["M3_thickness_sd_um"] == ""
+    # A summary from before the mean and SD were kept has neither.
+    old = specimen(ws, tmp_path, "P22_TGM2_WT_F_16")["name"]
+    ws.set_artifacts(old, {"molar_quant": str(write_molar(tmp_path / "data" / old, old, thickness={"median": 40.0}))})
+    assert results.gather(ws)["molar"][old]["thickness_mean_um"] is None
+
+
+def test_the_mean_over_the_root_of_the_junction_area_has_no_unit(ws, tmp_path):
+    """Mean µm over √(area) in µm. Version 6 summaries keep the per-tooth mean only in the thickness block."""
+    name = specimen(ws, tmp_path, "P22_TGM2_WT_F_17")["name"]
+    summary = write_molar(tmp_path / "data" / name, name,
+                          thickness={"median": 63.0, "mean": 60.0, "junction_area_mm2": 4.0,
+                                     "teeth": [{"name": "M1", "mean": 50.0}, {"name": "M2", "mean": 45.0}]},
+                          teeth=[("M1", 52.0, 2.5), ("M2", 47.0, 0.0), ("M3", 40.0, 1.0)])
+    ws.set_artifacts(name, {"molar_quant": str(summary)})
+    mq = results.gather(ws)["molar"][name]
+    assert mq["thickness_mean_per_sqrt_junction"] == pytest.approx(60.0 / 2000.0)
+    # M1 from the thickness block's mean; M2 has no junction; M3 has no mean anywhere.
+    assert [t["thickness_mean_um"] for t in mq["teeth"]] == [50.0, 45.0, None]
+    assert mq["teeth"][0]["thickness_mean_per_sqrt_junction"] == pytest.approx(50.0 / (2.5 ** 0.5 * 1000))
+    assert [t["thickness_mean_per_sqrt_junction"] for t in mq["teeth"][1:]] == [None, None]
+    row = next(csv.DictReader(io.StringIO(results.export(ws, "molar")[1])))
+    assert float(row["thickness_mean_per_sqrt_junction"]) == pytest.approx(0.03)
+    assert float(row["M1_thickness_mean_per_sqrt_junction"]) == pytest.approx(0.0316228, rel=1e-5)
+    assert row["M2_thickness_mean_per_sqrt_junction"] == ""
+    # A tooth scaled up keeps the ratio: twice the thickness, four times the area.
+    assert results.per_sqrt_junction_area(120.0, 16.0) == results.per_sqrt_junction_area(60.0, 4.0)
+    assert results.per_sqrt_junction_area(None, 4.0) is None and results.per_sqrt_junction_area(60.0, 0.0) is None
+
+
 def test_the_patches_reach_results_and_the_export(ws, tmp_path):
     name = specimen(ws, tmp_path, "P22_TGM2_KO_F_15")["name"]
     patches = {"thin": {"share": 0.036, "patches_per_mm2": 2.5, "depth": 0.36, "shortfall": 0.077},
@@ -231,7 +274,15 @@ def test_the_incisor_metrics_and_export_read_the_cleaned_profile(ws, tmp_path):
     # The report's crossover: where 0.6 + 1.2 / (1 + e^-(z - 40)/6) reaches 1.
     assert metrics["crossover_z"] == pytest.approx(40 - 6 * math.log(2), abs=0.2)
     assert 1.75 < metrics["plateau_ratio"] < metrics["peak_ratio"] < 1.81
+    # The plateau and peak in density, off the enamel's own running median: the
+    # profile's density is the ratio times a dentin reference of 13000.
+    for key in ("plateau", "peak"):
+        assert metrics[f"{key}_raw"] == pytest.approx(13000 * metrics[f"{key}_ratio"])
+        assert metrics[f"{key}_mgHA"] == pytest.approx(mg(metrics[f"{key}_raw"]))
+    assert (metrics["dentin_raw"], metrics["dentin_mgHA"]) == (13000, pytest.approx(mg(13000)))
     prof = got["incisor"][name]
+    uncalibrated = results.incisor_metrics(prof)
+    assert uncalibrated["plateau_raw"] == metrics["plateau_raw"] and uncalibrated["plateau_mgHA"] is None
     assert prof["outlier"][150] and not prof["kept"][150] and "residual" not in prof, "the page gets no residuals"
     rows = list(csv.DictReader(io.StringIO(results.export(ws, "incisor")[1])))
     flipped = next(r for r in rows if r["z"] == "150")
@@ -370,3 +421,20 @@ def test_each_view_converts_with_the_calibration_its_values_answer_to(ws, tmp_pa
     volume = ws.create({**details, "replicate": 3}, name="P22_TGM2_KO_F_3", source={"kind": "volume", "path": str(nrrd)})
     assert results.view_calibration(ws, volume, "source")["divisor"] == 1024.0
     assert results.view_calibration(ws, volume, "source") == results.ha_calibration(ws, volume)
+
+
+def test_the_landmarks_say_which_straightened_slices_they_map_to(ws, tmp_path):
+    """The compare page draws each landmark on the straightened incisor at the slice map_landmarks matched it to."""
+    rec = specimen(ws, tmp_path, "P22_TGM2_WT_F_1")
+    path = tmp_path / "data" / rec["name"] / f"{rec['name']}_landmarks.csv"
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["landmark", "kind", "z_percent_start", "z_percent_end", "z_percent_mid", "z_start", "z_end",
+                         "slice_start", "slice_end", "length_mm", "source"])
+        writer.writerow(["eruption", "event", 81.5, "", 81.5, 1621, "", 412, "", "", "auto"])
+        writer.writerow(["M1", "span", 30.0, 45.0, 37.5, 820, 973, 150, 228, 1.2, "manual"])
+    rec = ws.set_artifacts(rec["name"], {"landmarks": path})
+    got = {r["landmark"]: r for r in results.landmarks(ws, rec)}
+    assert (got["eruption"]["slice_start"], got["eruption"]["slice_end"]) == (412, None)
+    assert (got["M1"]["slice_start"], got["M1"]["slice_end"]) == (150, 228)
+    assert (got["M1"]["start"], got["M1"]["end"], got["M1"]["source"]) == (30.0, 45.0, "manual")

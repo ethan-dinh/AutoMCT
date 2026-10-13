@@ -59,7 +59,13 @@ does not change with wear, and it is the usual reference in enamel studies.
 The same measurement from the outer surface -- the depth of enamel beneath
 each point of the tooth's surface -- is what the map paints on the outer
 surface. On a curved crown the two are not symmetric (WT-M-1: 62 vs 57 um
-median), so every number says which it is.
+median), so every number says which it is. Each is summarized by its median,
+mean and standard deviation over the measured points, and its percentiles.
+
+The map carries a sample of the lines themselves (``_measurement_lines``),
+each from the point it was measured at to the point it reached, so what was
+measured can be seen: a line that crosses dentin, skips a groove, or ends on
+the wrong face is a pairing to doubt.
 
 Where teeth touch
 -----------------
@@ -140,6 +146,10 @@ _CHUNK = 50_000
 # The viewer's two surfaces together stay under this many triangles; the
 # marching-cubes step for display is raised until they do.
 _DISPLAY_TRIANGLES = 600_000
+
+# At most this many measurement lines go into the map per direction: a random
+# sample of the pairings, so the lines shown are spread evenly over the surface.
+_DISPLAY_LINES = 20_000
 
 # Tooth labels are widened by this many voxels before the surface points look
 # them up: the outer surface lies just outside the molar mask.
@@ -696,13 +706,18 @@ def nearest_through_enamel(src: np.ndarray, dst: np.ndarray, image: np.ndarray, 
 
 
 def thickness_stats(values: np.ndarray) -> dict:
-    """Median, mean and percentiles (um) of the finite values, with how many there were."""
+    """Median, mean, standard deviation and percentiles (um) of the finite values, with how many there were.
+
+    The standard deviation is the sample one (n - 1) over the measured points;
+    None when fewer than two were measured.
+    """
     v = values[np.isfinite(values)]
     if not v.size:
-        return {"median": None, "mean": None, "p5": None, "p25": None, "p75": None, "p95": None, "n_points": 0}
+        return {"median": None, "mean": None, "sd": None, "p5": None, "p25": None, "p75": None, "p95": None,
+                "n_points": 0}
     p5, p25, p50, p75, p95 = np.percentile(v, [5, 25, 50, 75, 95])
-    return {"median": float(p50), "mean": float(v.mean()), "p5": float(p5), "p25": float(p25),
-            "p75": float(p75), "p95": float(p95), "n_points": int(v.size)}
+    return {"median": float(p50), "mean": float(v.mean()), "sd": float(v.std(ddof=1)) if v.size > 1 else None,
+            "p5": float(p5), "p25": float(p25), "p75": float(p75), "p95": float(p95), "n_points": int(v.size)}
 
 
 def _share(values: np.ndarray) -> float | None:
@@ -1003,9 +1018,10 @@ def measure(image: np.ndarray, molar: np.ndarray, enamel: np.ndarray, spacing: t
         },
         "teeth": [{k: v for k, v in t.items() if k != "label"} for t in teeth],
     }
-    logger.info("Enamel thickness (from the junction): median %.1f um, middle half %.1f-%.1f um, "
-                "%.0f%% of %d junction points measured; junction area %.4f mm2",
-                summary["median"] or float("nan"), summary["p25"] or float("nan"), summary["p75"] or float("nan"),
+    logger.info("Enamel thickness (from the junction): median %.1f um, mean %.1f +/- %.1f um (SD), middle half "
+                "%.1f-%.1f um, %.0f%% of %d junction points measured; junction area %.4f mm2",
+                summary["median"] or float("nan"), summary["mean"] or float("nan"), summary["sd"] or float("nan"),
+                summary["p25"] or float("nan"), summary["p75"] or float("nan"),
                 100 * (summary["share_measured"] or 0), len(junction.verts), area_total)
 
     shades = None
@@ -1056,7 +1072,8 @@ def measure(image: np.ndarray, molar: np.ndarray, enamel: np.ndarray, spacing: t
     shown = None
     if display:
         shown = _display(image, smooth, levels, near, dist, molar, enamel, voxel_um, tooth_lookup, names or {},
-                         outer, junction, from_outer, from_junction, shades=shades, outer_partner=outer_partner)
+                         outer, junction, from_outer, from_junction, shades=shades, outer_partner=outer_partner,
+                         junction_partner=partner, contact=contact)
     return summary, shown, warnings
 
 
@@ -1138,7 +1155,8 @@ def _tooth_lookup(labels: np.ndarray | None):
 
 def _display(image, smooth, levels, near, dist, molar, enamel, voxel_um, tooth_lookup, names,
              outer: Surface, junction: Surface, from_outer, from_junction, *, shades: dict | None = None,
-             outer_partner: np.ndarray | None = None) -> dict:
+             outer_partner: np.ndarray | None = None, junction_partner: np.ndarray | None = None,
+             contact: np.ndarray | None = None) -> dict:
     """Meshes for the map, in a viewer frame: x along the jaw, y toward the crowns, in um.
 
     Two solids. The enamel, closed -- its outer surface, its underside on the
@@ -1152,6 +1170,12 @@ def _display(image, smooth, levels, near, dist, molar, enamel, voxel_um, tooth_l
     deficit, NaN where not judged, and whether the point lies in a counted
     patch); the outer surface takes those of the junction point it was
     measured to (``outer_partner``), so the colour runs through the enamel.
+
+    With the pairings (``junction_partner``: each junction point's outer or
+    contact point, ``contact`` the contact points after the outer ones; and
+    ``outer_partner`` the other way) the map also carries the measurement
+    lines themselves, a sample of them (``_DISPLAY_LINES``), to check what was
+    measured: see ``_measurement_lines``.
     """
     triangles = len(outer.faces) + len(junction.faces)
     step = max(1, int(np.ceil(np.sqrt(triangles / _DISPLAY_TRIANGLES))))
@@ -1214,10 +1238,42 @@ def _display(image, smooth, levels, near, dist, molar, enamel, voxel_um, tooth_l
             layer["tooth"] = tooth_lookup(surf.verts).astype(np.uint8)
         layer.update(extra[key])
         layers[key] = layer
-    logger.info("Thickness map: %s (display step %d)",
-                ", ".join(f"{k} {len(v['faces'])} triangles" for k, v in layers.items()), step)
-    return {"layers": layers, "teeth": {str(k): v for k, v in names.items()}, "step": step,
+    lines = {}
+    if junction_partner is not None:
+        ends = np.concatenate([outer.verts, contact]) if contact is not None and len(contact) else outer.verts
+        lines["junction"] = _measurement_lines(junction.verts, ends, junction_partner, from_junction, frame,
+                                               to_contact=junction_partner >= len(outer.verts))
+    if outer_partner is not None:
+        lines["outer"] = _measurement_lines(outer.verts, junction.verts, outer_partner, from_outer, frame)
+    lines = {k: v for k, v in lines.items() if v["n"]}
+    logger.info("Thickness map: %s (display step %d)%s",
+                ", ".join(f"{k} {len(v['faces'])} triangles" for k, v in layers.items()), step,
+                "".join(f", {v['n']} of {v['n_measured']} lines from the {k}" for k, v in lines.items()))
+    return {"layers": layers, "lines": lines, "teeth": {str(k): v for k, v in names.items()}, "step": step,
             "voxel_um": [float(v) for v in voxel_um]}
+
+
+def _measurement_lines(src: np.ndarray, dst: np.ndarray, partner: np.ndarray, thickness: np.ndarray, frame,
+                       *, to_contact: np.ndarray | None = None, limit: int = _DISPLAY_LINES, seed: int = 0) -> dict:
+    """A sample of the measurement lines, in the viewer frame, to draw over the map.
+
+    Each measured ``src`` point was paired with ``dst[partner]``; the line
+    between them is the one its thickness was read along. At most ``limit``
+    of them are kept, drawn at random (``seed``) so they are spread evenly
+    over the surface, and in a random order so the viewer can show any
+    leading share of them and still have them spread. ``to_contact`` marks
+    the lines that end at a contact between teeth rather than at the outer
+    surface. ``n_measured`` is how many lines there were to choose from.
+    """
+    measured = np.flatnonzero((partner >= 0) & np.isfinite(thickness))
+    rng = np.random.default_rng(seed)
+    chosen = rng.permutation(measured) if len(measured) <= limit else rng.choice(measured, limit, replace=False)
+    start = frame(src[chosen]) if len(chosen) else np.zeros((0, 3), dtype=np.float32)
+    end = frame(dst[partner[chosen]]) if len(chosen) else np.zeros((0, 3), dtype=np.float32)
+    flags = (to_contact[chosen] if to_contact is not None else np.zeros(len(chosen), dtype=bool)).astype(np.uint8)
+    return {"n": int(len(chosen)), "n_measured": int(len(measured)), "start": np.asarray(start, dtype=np.float32),
+            "end": np.asarray(end, dtype=np.float32), "value": thickness[chosen].astype(np.float32),
+            "to_contact": flags}
 
 
 def _solid_mesh(field: np.ndarray, step: int) -> Surface:
@@ -1296,16 +1352,21 @@ _NO_DEFICIT = -32768
 PATCH_KINDS = ("thin", "low_density")
 
 
-def _pack(layers: dict) -> tuple[bytes, dict]:
-    """The meshes as one little-endian blob plus where each array sits in it.
+def _pack(layers: dict, lines: dict | None = None) -> tuple[bytes, dict]:
+    """The meshes, and the measurement lines, as one little-endian blob plus where each array sits in it.
 
     Positions are quantized to 16 bits over the shared bounding box (a few
     hundredths of a micrometre on a molar row); thickness is stored in tenths
     of a micrometre, 65535 meaning no measurement. Each patch kind's deficit
     is stored in tenths of a percent, signed (``_NO_DEFICIT``: not judged),
-    and whether a point lies in a counted patch as a byte.
+    and whether a point lies in a counted patch as a byte. Each set of lines
+    (``_measurement_lines``) is its start points then its end points, both
+    quantized like the meshes, its thickness in tenths and a byte per line
+    for one that ends at a contact.
     """
-    allpos = np.concatenate([layer["pos"] for layer in layers.values()])
+    lines = lines or {}
+    allpos = np.concatenate([layer["pos"] for layer in layers.values()]
+                            + [a for v in lines.values() for a in (v["start"], v["end"])])
     lo, hi = allpos.min(axis=0), allpos.max(axis=0)
     scale = np.where(hi > lo, (hi - lo) / 65535.0, 1.0)
     blob = bytearray()
@@ -1336,6 +1397,15 @@ def _pack(layers: dict) -> tuple[bytes, dict]:
                 flag = np.asarray(layer.get(f"{kind}_patch", np.zeros(len(d))), dtype=np.float64)
                 entry[f"{kind}_patch"] = add((np.nan_to_num(flag) >= 0.5).astype("u1"))
         layout["layers"][name] = entry
+    layout["lines"] = {}
+    for name, part in lines.items():
+        quant = lambda a: np.clip(np.round((a - lo) / scale), 0, 65535).astype("<u2")  # noqa: E731
+        v = part["value"]
+        enc = np.where(np.isfinite(v), np.clip(np.round(np.nan_to_num(v) * 10.0), 0, 65534), 65535)
+        layout["lines"][name] = {"n": int(part["n"]), "n_measured": int(part["n_measured"]),
+                                 "start": add(quant(part["start"])), "end": add(quant(part["end"])),
+                                 "value": add(enc.astype("<u2")),
+                                 "to_contact": add(np.asarray(part["to_contact"]).astype("u1"))}
     return bytes(blob), layout
 
 
@@ -1357,13 +1427,14 @@ def _patch_meta(block: dict | None) -> dict | None:
 
 def write_viewer(path: str, display: dict, *, sample: str, summary: dict, vmax: float) -> str:
     """A self-contained HTML page: the thickness map in 3-D, with its legend."""
-    blob, layout = _pack(display["layers"])
+    blob, layout = _pack(display["layers"], display.get("lines"))
     payload = base64.b64encode(gzip.compress(blob, 6)).decode("ascii")
     meta = {
         "sample": sample, "vmax": float(vmax), "layout": layout, "teeth": display["teeth"],
-        "reported": {k: summary.get(k) for k in ("median", "p25", "p75", "n_points", "share_measured",
+        "reported": {k: summary.get(k) for k in ("median", "mean", "sd", "p25", "p75", "n_points", "share_measured",
                                                  "junction_area_mm2")},
-        "from_outer": {k: (summary.get("from_outer_surface") or {}).get(k) for k in ("median", "p25", "p75")},
+        "from_outer": {k: (summary.get("from_outer_surface") or {}).get(k)
+                       for k in ("median", "mean", "sd", "p25", "p75", "n_points")},
         "per_tooth": summary.get("teeth") or [],
         "background_from": (summary.get("levels") or {}).get("background_from"),
         "voxel_um": display["voxel_um"],

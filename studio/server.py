@@ -1234,8 +1234,8 @@ class Handler(BaseHTTPRequestHandler):
         record = self.st._record(name)  # noqa: SLF001
         profile = results.incisor_profile(self.st.ws, record)
         run = read_json(self.st.ws.artifact(record, "incisor_run")) if self.st.ws.artifact(record, "incisor_run") else None
-        self._json({"profile": profile, "metrics": results.incisor_metrics(profile),
-                    "calibration": results.ha_calibration(self.st.ws, record) if profile else None,
+        cal = results.ha_calibration(self.st.ws, record) if profile else None
+        self._json({"profile": profile, "metrics": results.incisor_metrics(profile, cal), "calibration": cal,
                     "landmarks": results.landmarks(self.st.ws, record),
                     "run": {k: (run or {}).get(k) for k in ("orientation", "dentin_baseline", "status_counts")}})
 

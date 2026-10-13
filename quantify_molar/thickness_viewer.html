@@ -2,7 +2,8 @@
 <!--
   Template for <sample>_thickness_map.html, filled in by enamel_surfaces.write_viewer:
   __SAMPLE__ (the name), "__META__" (JSON: layout, per-tooth numbers) and
-  __DATA__ (the meshes, gzip + base64). Self-contained: no network, no libraries.
+  __DATA__ (the meshes and a sample of the measurement lines, gzip + base64).
+  Self-contained: no network, no libraries.
 -->
 <html lang="en">
 <head>
@@ -56,6 +57,8 @@
   .keys { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; font-size: 12px; color: var(--ink-2); }
   .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
   .caption { color: var(--ink-3); font-size: 11.5px; margin-top: 6px; }
+  .sw.line { height: 3px; border-radius: 2px; vertical-align: 2px; }
+  #lines-count { font-variant-numeric: tabular-nums; }
   table { border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 12px; margin-top: 4px; }
   th, td { padding: 2px 6px; text-align: right; white-space: nowrap; }
   th { color: var(--ink-3); font-weight: 500; }
@@ -95,11 +98,26 @@
     <label><input type="checkbox" id="dentin" checked> Dentin and roots</label>
     <label>Scale <input type="number" id="vmin" min="0" max="2000" step="10" aria-label="Scale from"> to <input type="number" id="vmax" min="1" max="2000" step="10" aria-label="Scale to"> <span id="unit">µm</span></label>
   </div>
+  <div class="row" id="lines-row" hidden>
+    <label><input type="checkbox" id="lines"> Measurement lines</label>
+    <span class="seg" role="group" aria-label="Which lines">
+      <button type="button" data-lines="junction" title="The reported thickness: from each point of the enamel–dentin junction to the outer surface">From the junction</button>
+      <button type="button" data-lines="outer" title="The enamel's depth beneath each point of the outer surface: what the map paints on it">From the outer surface</button>
+    </span>
+  </div>
+  <div class="row" id="lines-more" hidden>
+    <label class="grow">Show <input type="range" id="lines-share" min="1" max="100" step="1" value="25" aria-label="Share of the lines shown, percent"> <span id="lines-val" class="num">25%</span></label>
+    <span class="seg" role="group" aria-label="Line colour">
+      <button type="button" data-line-colour="plain">Plain</button>
+      <button type="button" data-line-colour="value">By thickness</button>
+    </span>
+    <span class="sub" id="lines-count"></span>
+  </div>
   <div class="row">
     <button type="button" id="save">Save image</button>
     <button type="button" id="hide">Hide panels</button>
   </div>
-  <div class="hint">Drag to rotate · Shift- or right-drag to move · Scroll to zoom · Double-click to reset</div>
+  <div class="hint">Drag to rotate · Shift- or right-drag to move · Scroll to zoom · Double-click to reset · Fade the enamel to see the measurement lines inside it</div>
 </div>
 <button type="button" id="show">Show panels</button>
 <div id="teeth" class="panel"></div>
@@ -114,6 +132,9 @@ const meta = JSON.parse(document.getElementById("meta").textContent);
 // Sequential blue, dark to light: on the dark stage, thicker enamel is brighter.
 const RAMP = ["#184f95", "#1c5cab", "#256abf", "#2a78d6", "#3987e5", "#5598e7", "#6da7ec", "#86b6ef", "#9ec5f4", "#b7d3f6", "#cde2fb"];
 const NO_DATA = "#8a8378", CONTEXT = "#4b5557", STAGE = "#0e1213";
+// Measurement lines: a warm plain colour against the blue enamel and grey dentin, and
+// pink for a line that ends at a contact between teeth rather than at the outer surface.
+const LINE_PLAIN = "#f2c14e", LINE_CONTACT = "#ee6fb0", LINE_WIDTH_PX = 2.5;
 // Sequential orange, dark to light (OKLCH L 0.36-0.91 around the palette's orange): the more the enamel falls
 // short of the enamel around it, the brighter. Patches show at full colour, the rest of the judged enamel muted.
 const SHORT_RAMP = ["#5c2e24", "#7c311e", "#9b3513", "#b73c04", "#ce4a06", "#e05e21", "#ed7740", "#f39264", "#f5ad8a", "#fac5ab", "#ffd8bb"];
@@ -135,6 +156,10 @@ const FOV = 30 * Math.PI / 180, PITCH_MAX = 1.5607;
 const VIEWS = { side: [0, 0.15], top: [0, PITCH_MAX], other: [Math.PI, 0.15], bottom: [0, -PITCH_MAX] };
 const CAPTION = "Colour: the enamel's thickness where it is measured, along lines through the enamel between its outer surface and the enamel–dentin junction.";
 const CAPTION_LIFTED = " With the enamel faded, the dentin's crown shows the thickness of the enamel above each point.";
+const LINES_CAPTION = {
+  junction: "Lines: a sample of the measurements, each from a point of the enamel–dentin junction (thick end) to the nearest point of the outer surface a straight line through enamel reaches. Their lengths are the reported thickness.",
+  outer: "Lines: a sample of the measurements the outer surface is painted by, each from a point of the outer surface (thick end) to the nearest point of the enamel–dentin junction a straight line through enamel reaches.",
+};
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view"), tip = $("tip");
@@ -221,6 +246,32 @@ function decode(buf, spec) {
   return layer;
 }
 
+// Each line as a thin screen-space quad: four vertices, each holding both ends, which corner it
+// is (0: start left, 1: start right, 2: end left, 3: end right), the thickness, and whether the
+// line ends at a contact. The lines come in a random order, so the first k are a spread sample.
+function decodeLines(buf, spec) {
+  const { bbox_min: lo, scale } = meta.layout;
+  const n = spec.n;
+  const qa = new Uint16Array(buf, spec.start, n * 3), qb = new Uint16Array(buf, spec.end, n * 3);
+  const v = new Uint16Array(buf, spec.value, n), f = new Uint8Array(buf, spec.to_contact, n);
+  const a = new Float32Array(n * 12), b = new Float32Array(n * 12), corner = new Float32Array(n * 4);
+  const value = new Float32Array(n * 4), flag = new Float32Array(n * 4), index = new Uint32Array(n * 6);
+  let contacts = 0;
+  for (let i = 0; i < n; i++) {
+    for (let k = 0; k < 4; k++) {
+      const at = (i * 4 + k) * 3;
+      for (let c = 0; c < 3; c++) { a[at + c] = lo[c] + qa[i * 3 + c] * scale[c]; b[at + c] = lo[c] + qb[i * 3 + c] * scale[c]; }
+      corner[i * 4 + k] = k;
+      value[i * 4 + k] = v[i] === 65535 ? 0 : v[i] / 10;
+      flag[i * 4 + k] = f[i];
+    }
+    if (f[i]) contacts++;
+    const o = i * 4;
+    index.set([o, o + 1, o + 2, o + 1, o + 3, o + 2], i * 6);
+  }
+  return { n, nMeasured: spec.n_measured, contacts, a, b, corner, value, flag, index };
+}
+
 // ------------------------------------------------------------------ WebGL
 const gl = canvas.getContext("webgl2", { antialias: true, preserveDrawingBuffer: true, alpha: false });
 
@@ -304,7 +355,71 @@ void main() {
   outColor = vec4(hi / 255.0, (t - hi * 256.0) / 255.0, tooth, a / 255.0);
 }`;
 
-function program(fragment) {
+// Measurement lines as screen-space quads: each vertex carries both ends; the quad is widened
+// across the line's direction on screen, full width at the start (the point the thickness is
+// reported at) tapering to a third at the far end, so the head of each line can be told.
+const LINE_VERTEX = `#version 300 es
+layout(location = 0) in vec3 aStart;
+layout(location = 1) in vec3 aEnd;
+layout(location = 2) in float aCorner;
+layout(location = 3) in float aValue;
+layout(location = 4) in float aFlag;
+uniform mat4 uProj, uView;
+uniform vec2 uViewport;
+uniform float uWidth;
+out float vValue;
+out float vFlag;
+out float vAlong;
+void main() {
+  vec4 ca = uProj * uView * vec4(aStart, 1.0);
+  vec4 cb = uProj * uView * vec4(aEnd, 1.0);
+  vec2 dir = (cb.xy / max(cb.w, 1e-4) - ca.xy / max(ca.w, 1e-4)) * uViewport;
+  float len = length(dir);
+  dir = len > 1e-6 ? dir / len : vec2(1.0, 0.0);
+  vec2 across = vec2(-dir.y, dir.x);
+  bool atEnd = aCorner >= 1.5;
+  float side = mod(aCorner, 2.0) < 0.5 ? -1.0 : 1.0;
+  vec4 c = atEnd ? cb : ca;
+  float width = atEnd ? uWidth * 0.35 : uWidth;
+  c.xy += across * side * width / uViewport * c.w;
+  gl_Position = c;
+  vValue = aValue;
+  vFlag = aFlag;
+  vAlong = atEnd ? 1.0 : 0.0;
+}`;
+
+// Plain or by thickness (the map's ramp and scale), contacts always in their own colour;
+// brighter at the start. Picking: the thickness over red and green, and in alpha 249 for a
+// line from the junction, 248 from the outer surface, 247 one that ends at a contact.
+const LINE_SHADE = `#version 300 es
+precision highp float;
+in float vValue;
+in float vFlag;
+in float vAlong;
+uniform sampler2D uRamp;
+uniform float uVmin, uVmax, uSteps;
+uniform int uByValue, uPick, uSet;
+uniform vec3 uPlain, uContact;
+out vec4 outColor;
+void main() {
+  if (uPick == 1) {
+    float t = clamp(floor(vValue * 10.0 + 0.5), 0.0, 65534.0);
+    float hi = floor(t / 256.0);
+    float a = vFlag > 0.5 ? 247.0 : (uSet == 0 ? 249.0 : 248.0);
+    outColor = vec4(hi / 255.0, (t - hi * 256.0) / 255.0, 0.0, a / 255.0);
+    return;
+  }
+  vec3 base = uPlain;
+  if (vFlag > 0.5) base = uContact;
+  else if (uByValue == 1) {
+    float t = clamp((vValue - uVmin) / max(uVmax - uVmin, 1e-3), 0.0, 1.0);
+    if (uSteps > 0.5) t = min(floor(t * uSteps), uSteps - 1.0) / max(uSteps - 1.0, 1.0);
+    base = texture(uRamp, vec2((t * 255.0 + 0.5) / 256.0, 0.5)).rgb;
+  }
+  outColor = vec4(base * (1.1 - 0.4 * vAlong), 1.0);
+}`;
+
+function compile(vertex, fragment, uniforms) {
   const make = (type, src) => {
     const s = gl.createShader(type);
     gl.shaderSource(s, src);
@@ -313,13 +428,38 @@ function program(fragment) {
     return s;
   };
   const p = gl.createProgram();
-  gl.attachShader(p, make(gl.VERTEX_SHADER, VERTEX));
+  gl.attachShader(p, make(gl.VERTEX_SHADER, vertex));
   gl.attachShader(p, make(gl.FRAGMENT_SHADER, fragment));
   gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
   const loc = {};
-  for (const name of ["uProj", "uView", "uRamp", "uVmin", "uVmax", "uSteps", "uMode", "uMute", "uOffset", "uNoData", "uContext", "uAlpha"]) loc[name] = gl.getUniformLocation(p, name);
+  for (const name of uniforms) loc[name] = gl.getUniformLocation(p, name);
   return { p, loc };
+}
+
+function program(fragment) {
+  return compile(VERTEX, fragment, ["uProj", "uView", "uRamp", "uVmin", "uVmax", "uSteps", "uMode", "uMute", "uOffset", "uNoData", "uContext", "uAlpha"]);
+}
+
+function uploadLines(set) {
+  const buffer = (data) => {
+    const b = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    return b;
+  };
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  [[0, set.a, 3], [1, set.b, 3], [2, set.corner, 1], [3, set.value, 1], [4, set.flag, 1]].forEach(([loc, data, size]) => {
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer(data));
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+  });
+  const index = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, index);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, set.index, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  set.vao = vao;
 }
 
 function upload(layer) {
@@ -409,9 +549,12 @@ function setView(name) {
 }
 
 // ------------------------------------------------------------------ drawing
-const layers = {};
-let shade, pick, ramps = {}, pickTarget = null;
+const layers = {}, lineSets = {};
+let shade, pick, lineProg, ramps = {}, pickTarget = null;
 let enamelAlpha = 1, showDentin = true, mode = "thickness";
+// The measurement lines: which set is shown (null: none), what share of the sample, and their colour.
+let linesFrom = null, linesShare = 0.25, lineColour = "plain";
+const linesShown = () => (linesFrom && lineSets[linesFrom] ? lineSets[linesFrom] : null);
 let vmin = MODES.thickness.vmin, vmax = MODES.thickness.vmax;
 const steps = () => (MODES[mode].step ? Math.max(1, Math.round((vmax - vmin) / MODES[mode].step)) : 0);
 
@@ -483,7 +626,38 @@ function draw(pixel = null) {
     // Deficits can be negative (thicker than around): read back shifted up.
     gl.uniform1f(prog.loc.uOffset, mode === "thickness" ? 0 : 32768);
   }
-  for (const [layer, part, alpha] of visible(!!pixel)) {
+  const parts = visible(!!pixel);
+  // The lines go in after the dentin and before the enamel: inside an opaque enamel they stay
+  // hidden; a faded enamel, drawn without depth, lets them show through.
+  const linesBefore = parts.findIndex(([, part]) => part === 0);
+  const drawLines = () => {
+    const set = linesShown();
+    if (!set || !lineProg) return;
+    gl.useProgram(lineProg.p);
+    gl.uniformMatrix4fv(lineProg.loc.uProj, false, perspective(w / h, near, far));
+    gl.uniformMatrix4fv(lineProg.loc.uView, false, view.m);
+    gl.uniform2f(lineProg.loc.uViewport, w, h);
+    gl.uniform1f(lineProg.loc.uWidth, LINE_WIDTH_PX * Math.min(window.devicePixelRatio || 1, 2));
+    gl.uniform1i(lineProg.loc.uPick, pixel ? 1 : 0);
+    gl.uniform1i(lineProg.loc.uSet, linesFrom === "junction" ? 0 : 1);
+    gl.uniform1i(lineProg.loc.uByValue, lineColour === "value" && mode === "thickness" ? 1 : 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, ramps.thickness);
+    gl.uniform1i(lineProg.loc.uRamp, 0);
+    gl.uniform1f(lineProg.loc.uVmin, mode === "thickness" ? vmin : MODES.thickness.vmin);
+    gl.uniform1f(lineProg.loc.uVmax, mode === "thickness" ? vmax : MODES.thickness.vmax);
+    gl.uniform1f(lineProg.loc.uSteps, mode === "thickness" ? steps() : 0);
+    gl.uniform3fv(lineProg.loc.uPlain, hex(LINE_PLAIN));
+    gl.uniform3fv(lineProg.loc.uContact, hex(LINE_CONTACT));
+    gl.disable(gl.CULL_FACE);
+    gl.bindVertexArray(set.vao);
+    gl.drawElements(gl.TRIANGLES, 6 * Math.max(1, Math.round(set.n * linesShare)), gl.UNSIGNED_INT, 0);
+    gl.bindVertexArray(null);
+    gl.useProgram(prog.p);
+  };
+  if (linesBefore < 0) drawLines();
+  for (const [i, [layer, part, alpha]] of parts.entries()) {
+    if (i === linesBefore) drawLines();
     const faded = !pixel && alpha < 0.999;
     gl.uniform1i(prog.loc.uMode, part);
     if (!pixel) gl.uniform1f(prog.loc.uAlpha, alpha);
@@ -530,6 +704,12 @@ function readout(clientX, clientY) {
   const [r, g, b, a] = px;
   const tooth = meta.teeth[String(b)] || "";
   const at = tooth ? ` · ${tooth}` : "";
+  if (a === 249 || a === 248 || a === 247) {
+    const um = ((r * 256 + g) / 10).toFixed(1);
+    if (a === 247) return `Measurement line: ${um} µm from the junction to a contact between teeth`;
+    return a === 249 ? `Measurement line: ${um} µm from the junction to the outer surface`
+      : `Measurement line: ${um} µm from the outer surface to the junction`;
+  }
   if (mode !== "thickness") {
     const v = (r * 256 + g - 32768) / 10, patch = a === 251 || a === 250 ? " · in a patch" : "";
     const what = mode === "thin" ? ["thinner", "thicker"] : ["less mineral", "more mineral"];
@@ -686,8 +866,40 @@ function renderLegend() {
       deficit ? el("span", {}, el("span", { class: "sw", style: { background: bright } }), "Counted patch") : null,
       deficit ? el("span", {}, el("span", { class: "sw", style: { background: `linear-gradient(to right, ${muted(m.ramp[1])}, ${muted(m.ramp[6])})` } }), "Judged, not a patch") : null,
       el("span", {}, el("span", { class: "sw", style: { background: NO_DATA } }), deficit ? "Not judged" : "Enamel, not measured"),
-      layers.dentin ? el("span", {}, el("span", { class: "sw", style: { background: CONTEXT } }), "Dentin and roots") : null),
-    el("div", { class: "caption" }, (deficit ? MODE_CAPTION[mode](m.by) : CAPTION) + (enamelAlpha < 0.999 ? CAPTION_LIFTED : "")));
+      layers.dentin ? el("span", {}, el("span", { class: "sw", style: { background: CONTEXT } }), "Dentin and roots") : null,
+      linesShown() ? el("span", {}, el("span", { class: "sw line", style: { background: lineColour === "value" && !deficit ? `linear-gradient(to right, ${RAMP[2]}, ${RAMP[8]})` : LINE_PLAIN } }),
+        lineColour === "value" && !deficit ? "Measurement line, by its thickness" : "Measurement line") : null,
+      linesShown()?.contacts ? el("span", {}, el("span", { class: "sw line", style: { background: LINE_CONTACT } }), "Line to a contact between teeth") : null),
+    el("div", { class: "caption" }, (deficit ? MODE_CAPTION[mode](m.by) : CAPTION) + (enamelAlpha < 0.999 ? CAPTION_LIFTED : "")),
+    linesShown() ? el("div", { class: "caption" }, LINES_CAPTION[linesFrom]) : null);
+}
+
+function renderLineControls() {
+  const set = linesShown();
+  $("lines").checked = !!set;
+  $("lines-more").hidden = !set;
+  document.querySelectorAll("[data-lines]").forEach((b) => {
+    b.disabled = !lineSets[b.dataset.lines];
+    b.setAttribute("aria-pressed", String(!!set && b.dataset.lines === linesFrom));
+  });
+  document.querySelectorAll("[data-line-colour]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.lineColour === lineColour)));
+  $("lines-share").value = String(Math.round(linesShare * 100));
+  $("lines-val").textContent = `${Math.round(linesShare * 100)}%`;
+  if (set) {
+    const k = Math.max(1, Math.round(set.n * linesShare));
+    $("lines-count").textContent = `${k.toLocaleString()} of ${set.nMeasured.toLocaleString()} measured`;
+    $("lines-count").title = set.n < set.nMeasured ? `The file holds a random sample of ${set.n.toLocaleString()} of the ${set.nMeasured.toLocaleString()} lines measured.` : "";
+  }
+}
+
+// Which lines to show (null: none). Turned on behind an opaque enamel they would not be seen,
+// so the enamel is faded for them.
+function setLines(from) {
+  linesFrom = from && lineSets[from] ? from : null;
+  if (linesFrom && enamelAlpha > 0.999) setEnamel(40);
+  renderLineControls();
+  renderLegend();
+  requestRender();
 }
 
 function renderPatches() {
@@ -713,18 +925,21 @@ function renderTeeth() {
   const rows = (meta.per_tooth || []).filter((t) => t.median != null);
   const r = meta.reported || {};
   const range = (t) => (t.p25 == null ? "–" : `${fmt(t.p25)}–${fmt(t.p75)}`);
+  const meanSd = (t) => (t.mean == null ? "–" : t.sd == null ? fmt(t.mean) : `${fmt(t.mean)} ± ${fmt(t.sd)}`);
   const area = (v) => (v == null ? "–" : v.toFixed(3));
+  const hasMean = rows.some((t) => t.mean != null) || r.mean != null;
   $("teeth").replaceChildren(...[
     el("div", { class: "title" }, "Enamel thickness"),
     el("div", { class: "sub" }, "µm, from the enamel–dentin junction"),
     el("table", {},
       el("thead", {}, el("tr", {}, el("th", {}, "Tooth"), el("th", {}, "Median"), el("th", {}, "Middle half"),
+        hasMean ? el("th", { title: "Mean and standard deviation over the measured junction points" }, "Mean ± SD") : null,
         el("th", { title: "Area of the enamel–dentin junction" }, "Junction mm²"))),
       el("tbody", {},
         ...rows.map((t) => el("tr", {}, el("td", {}, t.name), el("td", {}, fmt(t.median)), el("td", {}, range(t)),
-          el("td", {}, area(t.junction_area_mm2)))),
+          hasMean ? el("td", {}, meanSd(t)) : null, el("td", {}, area(t.junction_area_mm2)))),
         el("tr", { class: rows.length ? "all" : "" }, el("td", {}, "All"), el("td", {}, fmt(r.median)), el("td", {}, range(r)),
-          el("td", {}, area(r.junction_area_mm2))))),
+          hasMean ? el("td", {}, meanSd(r)) : null, el("td", {}, area(r.junction_area_mm2))))),
     r.share_measured != null ? el("div", { class: "caption" }, `${fmt(100 * r.share_measured)}% of junction points measured.`) : null,
     meta.background_from && meta.background_from !== "scan"
       ? el("div", { class: "caption" }, "No scan around the tooth: background taken as zero.") : null,
@@ -807,6 +1022,11 @@ function saveImage() {
       upload(layers[name]);
     }
     if (!layers.enamel) throw new Error("the file holds no enamel.");
+    for (const [name, spec] of Object.entries(meta.layout.lines || {})) {
+      if (!spec.n) continue;
+      lineSets[name] = decodeLines(buf, spec);
+      uploadLines(lineSets[name]);
+    }
     // Fit: the centre of everything shown, and the farthest point from it.
     const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
     for (const layer of Object.values(layers)) {
@@ -816,6 +1036,7 @@ function saveImage() {
     radius = Math.max(1, Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2);
     shade = program(SHADE);
     pick = program(PICK);
+    lineProg = compile(LINE_VERTEX, LINE_SHADE, ["uProj", "uView", "uViewport", "uWidth", "uRamp", "uVmin", "uVmax", "uSteps", "uByValue", "uPick", "uSet", "uPlain", "uContact"]);
     ramps = { thickness: rampTexture(RAMP), thin: rampTexture(SHORT_RAMP), low_density: rampTexture(SHORT_RAMP) };
     const shown = (meta.modes || ["thickness"]).filter((k) => layers.enamel.modes[k]);
     document.querySelectorAll("[data-mode]").forEach((b) => {
@@ -836,6 +1057,11 @@ function saveImage() {
     $("dentin").checked = showDentin = !!layers.dentin;
     $("dentin").addEventListener("change", (e) => { showDentin = e.target.checked; renderLegend(); requestRender(); });
     $("enamel").addEventListener("input", (e) => setEnamel(Number(e.target.value)));
+    $("lines-row").hidden = !Object.keys(lineSets).length;
+    $("lines").addEventListener("change", (e) => setLines(e.target.checked ? (linesFrom || (lineSets.junction ? "junction" : Object.keys(lineSets)[0])) : null));
+    document.querySelectorAll("[data-lines]").forEach((b) => b.addEventListener("click", () => setLines(b.dataset.lines)));
+    document.querySelectorAll("[data-line-colour]").forEach((b) => b.addEventListener("click", () => { lineColour = b.dataset.lineColour; renderLineControls(); renderLegend(); requestRender(); }));
+    $("lines-share").addEventListener("input", (e) => { linesShare = clamp(Number(e.target.value), 1, 100) / 100; renderLineControls(); requestRender(); });
     document.querySelectorAll("[data-view]").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
     $("save").addEventListener("click", saveImage);
     $("hide").addEventListener("click", () => document.body.classList.add("bare"));
@@ -847,12 +1073,16 @@ function saveImage() {
     $("vmin").value = vmin;
     $("vmax").value = vmax;
     if (opts.get("dentin") === "0") $("dentin").checked = showDentin = false;
+    if (num("lines_share") != null) linesShare = clamp(num("lines_share"), 1, 100) / 100;
+    if (["plain", "value"].includes(opts.get("line_colour"))) lineColour = opts.get("line_colour");
     if (opts.get("panels") === "0") document.body.classList.add("bare");
     MODES.thickness.vmin = vmin; MODES.thickness.vmax = vmax;
     document.querySelectorAll("[data-mode]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.mode === "thickness")));
     if (MODES[opts.get("mode")] && opts.get("mode") !== "thickness") setMode(opts.get("mode"));
     renderTeeth();
     setEnamel(num("enamel") != null ? num("enamel") : 100);
+    renderLineControls();
+    if (lineSets[opts.get("lines")]) setLines(opts.get("lines"));
     setView(VIEWS[opts.get("view")] ? opts.get("view") : "side");
     document.body.dataset.ready = "1";
   } catch (err) {

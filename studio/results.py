@@ -214,11 +214,21 @@ def excluded_from(record: dict, scope: str) -> bool:
     return flag is not None and (flag["from"] == "all" or scope in flag["from"])
 
 
-def incisor_metrics(profile: dict | None) -> dict:
+def _median_curve(profile: dict, key: str) -> tuple[list[float], list[float]] | None:
+    """One of the cleaned running medians as (z %, value) in order along the tooth, or None when under 10 points."""
+    pts = sorted((z, v) for z, v in zip(profile["z_percent"], profile[key]) if z is not None and v is not None)
+    return ([p[0] for p in pts], [p[1] for p in pts]) if len(pts) >= 10 else None
+
+
+def incisor_metrics(profile: dict | None, cal: dict | None = None) -> dict:
     """The cleaned curve's landmarks -- where it crosses 1, its mature plateau, its peak -- and the slices behind it.
 
     The crossover and plateau are the report's crossing_of() and plateau_of(),
     read off the specimen's own running median rather than a group's trend.
+    The plateau and peak are read off the enamel density's running median too,
+    as stored (`_raw`) and converted with the HA calibration `cal` (`_mgHA`),
+    with the ratio's denominator beside them: the dentin reference, its median
+    over the kept slices.
     """
     if not profile:
         return {}
@@ -226,15 +236,25 @@ def incisor_metrics(profile: dict | None) -> dict:
     outliers = sum(profile["outlier"])
     measurable = sum(s in trajectory.MEASURABLE and r is not None for s, r in zip(profile["status"], profile["ratio"]))
     out = {"kept_slices": kept, "outlier_slices": outliers, "filtered_slices": measurable - kept - outliers}
-    pts = sorted((z, v) for z, v in zip(profile["z_percent"], profile["ratio_med"]) if z is not None and v is not None)
-    if len(pts) < 10:
+    curve = _median_curve(profile, "ratio_med")
+    if curve is None:
         return out
-    zs, fit = [p[0] for p in pts], [p[1] for p in pts]
-    return {**out, "crossover_z": trajectory.crossing_of(zs, fit), "plateau_ratio": trajectory.plateau_of(zs, fit),
-            "peak_ratio": float(max(fit))}
+    zs, fit = curve
+    out.update({"crossover_z": trajectory.crossing_of(zs, fit), "plateau_ratio": trajectory.plateau_of(zs, fit),
+                "peak_ratio": float(max(fit))})
+    density = _median_curve(profile, "density_med")
+    dentin = [d for d, k in zip(profile["dentin"], profile["kept"]) if k and d is not None]
+    raw = {"plateau": trajectory.plateau_of(*density) if density else None,
+           "peak": float(max(density[1])) if density else None,
+           "dentin": float(np.median(dentin)) if dentin else None}
+    for key, v in raw.items():
+        out[f"{key}_raw"] = v
+        out[f"{key}_mgHA"] = to_mg_ha([v], cal)[0]
+    return out
 
 
 def landmarks(ws: Workspace, record: dict) -> list[dict]:
+    """The mapped landmarks: where each falls along the incisor (z %), and the straightened incisor's slices it maps to."""
     path = ws.artifact(record, "landmarks")
     rows = _cached(path, _read_rows) if path else None
     out = []
@@ -243,6 +263,7 @@ def landmarks(ws: Workspace, record: dict) -> list[dict]:
             "landmark": r.get("landmark"), "kind": r.get("kind"),
             "start": _float(r.get("z_percent_start")), "end": _float(r.get("z_percent_end")),
             "mid": _float(r.get("z_percent_mid")), "length_mm": _float(r.get("length_mm")),
+            "slice_start": _float(r.get("slice_start")), "slice_end": _float(r.get("slice_end")),
             "source": "manual" if (r.get("source") or "manual") == "manual" else "auto",
         })
     return out
@@ -253,6 +274,19 @@ def per_junction_area(thickness_um, area_mm2):
     if thickness_um is None or not area_mm2:
         return None
     return thickness_um / area_mm2
+
+
+def per_sqrt_junction_area(thickness_um, area_mm2):
+    """The mean enamel thickness over the square root of the enamel–dentin junction's area, both in µm.
+
+    A pure number: the junction's square root is its linear size, so a tooth
+    scaled up in every direction keeps the same ratio, unlike the thickness
+    per mm², which falls with the square of size. 0.06 means the enamel is, on
+    average, 6% as thick as the junction is across.
+    """
+    if thickness_um is None or not area_mm2 or area_mm2 <= 0:
+        return None
+    return thickness_um / (math.sqrt(area_mm2) * 1000.0)
 
 
 # Patches of enamel thinner, or less dense, than the enamel around them, by
@@ -281,6 +315,13 @@ def molar(ws: Workspace, record: dict) -> dict | None:
     if not data:
         return None
     thickness = (data.get("enamel") or {}).get("thickness_um") or {}
+    # Each tooth's thickness block: summaries before version 7 keep the per-tooth
+    # mean only there, not in ``teeth``.
+    measured_tooth = {t.get("name"): t for t in thickness.get("teeth") or []}
+
+    def tooth_stat(t, key, stat):
+        value = t.get(key)
+        return value if value is not None else (measured_tooth.get(t["name"]) or {}).get(stat)
     density = (data.get("enamel") or {}).get("density") or {}
     raw = density.get("raw") or {}
     mg = density.get("mg_ha_cm3") or {}
@@ -306,12 +347,17 @@ def molar(ws: Workspace, record: dict) -> dict | None:
         # Summaries before version 3 carry the enamel mask's distance-map ridge
         # here, with no percentiles or junction area.
         "thickness_um": thickness.get("median"),
+        # Mean and standard deviation over the measured junction points (summaries from version 7).
+        "thickness_mean_um": thickness.get("mean"),
+        "thickness_sd_um": thickness.get("sd"),
         "thickness_p25_um": thickness.get("p25"),
         "thickness_p75_um": thickness.get("p75"),
         "thickness_measured": thickness.get("share_measured"),
         "thickness_background_from": (thickness.get("levels") or {}).get("background_from"),
         "junction_area_mm2": thickness.get("junction_area_mm2"),
         "thickness_um_per_mm2": per_junction_area(thickness.get("median"), thickness.get("junction_area_mm2")),
+        "thickness_mean_per_sqrt_junction": per_sqrt_junction_area(thickness.get("mean"),
+                                                                   thickness.get("junction_area_mm2")),
         "edge_blur_um": thickness.get("edge_blur_um"),
         **patch_numbers((data.get("enamel") or {}).get("patches")),
         "threshold": data["threshold"]["value"],
@@ -323,8 +369,13 @@ def molar(ws: Workspace, record: dict) -> dict | None:
         "dentin_under_enamel": (data.get("enamel_mask") or {}).get("dentin_under_enamel"),
         "teeth": [{"name": t["name"], "enamel_fraction": t["enamel_fraction"],
                    "volume_mm3": t["volume_mm3"], "enamel_mm3": t["enamel_volume_mm3"],
-                   "thickness_um": t.get("thickness_median_um"), "junction_area_mm2": t.get("junction_area_mm2"),
+                   "thickness_um": t.get("thickness_median_um"),
+                   "thickness_mean_um": tooth_stat(t, "thickness_mean_um", "mean"),
+                   "thickness_sd_um": tooth_stat(t, "thickness_sd_um", "sd"),
+                   "junction_area_mm2": t.get("junction_area_mm2"),
                    "thickness_um_per_mm2": per_junction_area(t.get("thickness_median_um"), t.get("junction_area_mm2")),
+                   "thickness_mean_per_sqrt_junction": per_sqrt_junction_area(
+                       tooth_stat(t, "thickness_mean_um", "mean"), t.get("junction_area_mm2")),
                    **{k: t.get(k) for k in PATCH_KEYS}}
                   for t in data.get("teeth") or []],
         "warnings": data.get("warnings") or [],
@@ -376,7 +427,7 @@ def gather(ws: Workspace) -> dict:
     return {
         "samples": samples,
         "incisor": incisor,
-        "incisor_metrics": {n: incisor_metrics(p) for n, p in incisor.items()},
+        "incisor_metrics": {n: incisor_metrics(p, p["calibration"]) for n, p in incisor.items()},
         "landmarks": marks,
         "molar": molars,
         "segmentation": seg,
@@ -451,6 +502,9 @@ def export(ws: Workspace, kind: str, names: list[str] | None = None) -> tuple[st
             for t in mq["teeth"]:
                 row[f"{t['name']}_enamel_fraction"] = t["enamel_fraction"]
                 row[f"{t['name']}_thickness_um"] = t.get("thickness_um")
+                row[f"{t['name']}_thickness_mean_um"] = t.get("thickness_mean_um")
+                row[f"{t['name']}_thickness_sd_um"] = t.get("thickness_sd_um")
+                row[f"{t['name']}_thickness_mean_per_sqrt_junction"] = t.get("thickness_mean_per_sqrt_junction")
                 row[f"{t['name']}_junction_area_mm2"] = t.get("junction_area_mm2")
                 row[f"{t['name']}_thickness_um_per_mm2"] = t.get("thickness_um_per_mm2")
                 for key in PATCH_KEYS:
@@ -465,13 +519,18 @@ def export(ws: Workspace, kind: str, names: list[str] | None = None) -> tuple[st
         cols = ID_COLUMNS + ["enamel_fraction", "enamel_mm3", "dentin_mm3", "total_mm3",
                                    "density_ratio", "enamel_minus_dentin", "enamel_median", "dentin_mode",
                                    *DENSITY_METRICS, "density_percentiles", "calibration",
-                                   "thickness_um", "thickness_p25_um", "thickness_p75_um", "thickness_measured",
+                                   "thickness_um", "thickness_mean_um", "thickness_sd_um", "thickness_p25_um",
+                                   "thickness_p75_um", "thickness_measured",
                                    "thickness_background_from", "junction_area_mm2", "thickness_um_per_mm2",
-                                   "threshold", "threshold_method", "enamel_mask", "junction_level_median",
+                                   "thickness_mean_per_sqrt_junction", "threshold", "threshold_method", "enamel_mask", "junction_level_median",
                                    "M1_enamel_fraction", "M2_enamel_fraction", "M3_enamel_fraction",
                                    "M1_thickness_um", "M2_thickness_um", "M3_thickness_um",
+                                   "M1_thickness_mean_um", "M2_thickness_mean_um", "M3_thickness_mean_um",
+                                   "M1_thickness_sd_um", "M2_thickness_sd_um", "M3_thickness_sd_um",
                                    "M1_junction_area_mm2", "M2_junction_area_mm2", "M3_junction_area_mm2",
                                    "M1_thickness_um_per_mm2", "M2_thickness_um_per_mm2", "M3_thickness_um_per_mm2",
+                                   "M1_thickness_mean_per_sqrt_junction", "M2_thickness_mean_per_sqrt_junction",
+                                   "M3_thickness_mean_per_sqrt_junction",
                                    "edge_blur_um", *PATCH_KEYS,
                                    *(f"{tooth}_{key}" for key in PATCH_KEYS for tooth in ("M1", "M2", "M3"))]
         return "molar_enamel.csv", _csv(rows, cols)

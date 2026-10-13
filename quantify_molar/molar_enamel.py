@@ -156,7 +156,7 @@ logger = logging.getLogger(__name__)
 #    the density of the enamel's core clear of its blurred faces;
 #    ``thickness_um`` gains the scan's blur at the outer face and each tooth's
 #    share of junction points measured.
-VERSION = 6
+VERSION = 7   # 7: thickness mean and SD per tooth, measurement lines in the map
 
 # How the enamel mask is made: between the enamel's two halfway faces, at
 # levels read where they are, or every voxel at or above the threshold.
@@ -273,11 +273,19 @@ class Tooth:
     # the row. See ``landmark_spans``.
     landmark_z_start: int | None = None
     landmark_z_end: int | None = None
-    # Enamel thickness, from the enamel-dentin junction (um), and that junction's area.
+    # Enamel thickness, from the enamel-dentin junction (um): its median, mean
+    # and standard deviation over the measured points, its middle half, and
+    # that junction's area.
     thickness_median_um: float | None = None
+    thickness_mean_um: float | None = None
+    thickness_sd_um: float | None = None
     thickness_p25_um: float | None = None
     thickness_p75_um: float | None = None
     junction_area_mm2: float | None = None
+    # The mean thickness over the junction's linear size (the square root of
+    # its area), both in um: a pure number, the same for a tooth of the same
+    # shape at any size (``per_sqrt_junction_area``).
+    thickness_mean_per_sqrt_junction: float | None = None
     # The share of the junction's points whose thickness was measured.
     thickness_measured: float | None = None
     # Patches of enamel thinner, or less dense, than the enamel around them
@@ -1161,9 +1169,13 @@ def quantify(volume: np.ndarray, spacing: tuple[float, float, float] | None, *,
             stats = per_tooth.get(tooth.name)
             if stats:
                 tooth.thickness_median_um = stats["median"]
+                tooth.thickness_mean_um = stats.get("mean")
+                tooth.thickness_sd_um = stats.get("sd")
                 tooth.thickness_p25_um = stats["p25"]
                 tooth.thickness_p75_um = stats["p75"]
                 tooth.junction_area_mm2 = stats["junction_area_mm2"]
+                tooth.thickness_mean_per_sqrt_junction = per_sqrt_junction_area(stats.get("mean"),
+                                                                                 stats["junction_area_mm2"])
                 tooth.thickness_measured = stats.get("share_measured")
             thin = by_kind["thin"].get(tooth.name)
             if thin:
@@ -1276,7 +1288,8 @@ def _dominant_tooth_per_slice(labels: np.ndarray, names: dict[int, str]) -> list
 TEETH_COLUMNS = ("sample", "name", "voxels", "volume_mm3", "enamel_voxels", "enamel_volume_mm3",
                  "enamel_fraction", "enamel_median", "dentin_median", "z_start", "z_end",
                  "crown_z_start", "crown_z_end", "landmark_z_start", "landmark_z_end",
-                 "thickness_median_um", "thickness_p25_um", "thickness_p75_um", "junction_area_mm2",
+                 "thickness_median_um", "thickness_mean_um", "thickness_sd_um", "thickness_p25_um",
+                 "thickness_p75_um", "junction_area_mm2", "thickness_mean_per_sqrt_junction",
                  "thickness_measured", "thin_patch_share", "thin_patches_per_mm2", "thin_patch_depth",
                  "thickness_shortfall", "low_density_patch_share", "low_density_patches_per_mm2",
                  "low_density_patch_depth", "density_shortfall", "core_density_raw", "core_density_mgHA")
@@ -1288,10 +1301,14 @@ SUMMARY_COLUMNS = ("sample", "total_volume_mm3", "enamel_volume_mm3", "dentin_vo
                    "enamel_mean_raw", "enamel_low_raw", "enamel_high_raw", "density_percentiles",
                    "calibration", "dentin_mode", "threshold", "threshold_method",
                    "enamel_mask", "junction_level", "dentin_under_enamel",
-                   "thickness_median_um", "thickness_mean_um", "thickness_p25_um", "thickness_p75_um",
-                   "thickness_measured", "thickness_background_from", "junction_area_mm2", "n_teeth",
-                   "M1_enamel_fraction", "M2_enamel_fraction", "M3_enamel_fraction",
+                   "thickness_median_um", "thickness_mean_um", "thickness_sd_um", "thickness_p25_um",
+                   "thickness_p75_um", "thickness_measured", "thickness_background_from", "junction_area_mm2",
+                   "thickness_mean_per_sqrt_junction", "n_teeth", "M1_enamel_fraction", "M2_enamel_fraction", "M3_enamel_fraction",
                    "M1_thickness_um", "M2_thickness_um", "M3_thickness_um",
+                   "M1_thickness_mean_um", "M2_thickness_mean_um", "M3_thickness_mean_um",
+                   "M1_thickness_sd_um", "M2_thickness_sd_um", "M3_thickness_sd_um",
+                   "M1_thickness_mean_per_sqrt_junction", "M2_thickness_mean_per_sqrt_junction",
+                   "M3_thickness_mean_per_sqrt_junction",
                    "M1_junction_area_mm2", "M2_junction_area_mm2", "M3_junction_area_mm2",
                    "M1_M2_contact_mm2", "M2_M3_contact_mm2", "M1_M2_gap_um", "M2_M3_gap_um",
                    "edge_blur_um", "thin_judged_share", "thin_patch_share", "thin_patches_per_mm2",
@@ -1334,6 +1351,20 @@ def patch_columns(block: dict | None) -> dict:
     }
 
 
+def per_sqrt_junction_area(thickness_um: float | None, area_mm2: float | None) -> float | None:
+    """Mean thickness over the square root of the enamel-dentin junction's area, both in um.
+
+    The square root of the area is the junction's linear size, so the ratio
+    has no unit and does not change when a tooth is scaled up in every
+    direction; 0.06 means the enamel is on average 6% as thick as its junction
+    is across. For the whole row the area is the three junctions together,
+    which is no one tooth's size: the per-tooth values are the proportion.
+    """
+    if thickness_um is None or not area_mm2 or area_mm2 <= 0:
+        return None
+    return float(thickness_um) / (float(np.sqrt(area_mm2)) * 1000.0)
+
+
 def summary_row(sample: str, summary: dict) -> dict:
     """Flatten one sample's summary into a summary-CSV row."""
     thickness = summary["enamel"].get("thickness_um") or {}
@@ -1349,6 +1380,8 @@ def summary_row(sample: str, summary: dict) -> dict:
         "thickness_measured": thickness.get("share_measured"),
         "thickness_background_from": (thickness.get("levels") or {}).get("background_from"),
         "junction_area_mm2": thickness.get("junction_area_mm2"),
+        "thickness_mean_per_sqrt_junction": per_sqrt_junction_area(thickness.get("mean"),
+                                                                   thickness.get("junction_area_mm2")),
         "sample": sample,
         "total_volume_mm3": summary["total"]["volume_mm3"],
         "enamel_volume_mm3": summary["enamel"]["volume_mm3"],
@@ -1361,6 +1394,7 @@ def summary_row(sample: str, summary: dict) -> dict:
         "threshold": summary["threshold"]["value"],
         "threshold_method": summary["threshold"]["method"],
         "thickness_mean_um": thickness.get("mean"),
+        "thickness_sd_um": thickness.get("sd"),
         "thickness_median_um": thickness.get("median"),
         "n_teeth": summary["n_teeth"],
         "edge_blur_um": thickness.get("edge_blur_um"),
@@ -1369,6 +1403,10 @@ def summary_row(sample: str, summary: dict) -> dict:
     for tooth in summary["teeth"]:
         for key, value in ((f"{tooth['name']}_enamel_fraction", tooth["enamel_fraction"]),
                            (f"{tooth['name']}_thickness_um", tooth.get("thickness_median_um")),
+                           (f"{tooth['name']}_thickness_mean_um", tooth.get("thickness_mean_um")),
+                           (f"{tooth['name']}_thickness_sd_um", tooth.get("thickness_sd_um")),
+                           (f"{tooth['name']}_thickness_mean_per_sqrt_junction",
+                            tooth.get("thickness_mean_per_sqrt_junction")),
                            (f"{tooth['name']}_junction_area_mm2", tooth.get("junction_area_mm2")),
                            (f"{tooth['name']}_thickness_measured", tooth.get("thickness_measured")),
                            (f"{tooth['name']}_thin_patch_share", tooth.get("thin_patch_share")),
@@ -1630,10 +1668,12 @@ def run_sample(sample: str, volume_path: str, out_dir: str, args: argparse.Names
                 logger.info("  enamel density (%s): mean %.6g, %s-%s percentile %.6g-%.6g", units,
                             stats["mean"], _ordinal(low_p), _ordinal(high_p), stats["low"], stats["high"])
     for tooth in summary["teeth"]:
-        thick = tooth.get("thickness_median_um")
+        thick, mean, sd = tooth.get("thickness_median_um"), tooth.get("thickness_mean_um"), tooth.get("thickness_sd_um")
         thin, low = tooth.get("thin_patch_share"), tooth.get("low_density_patch_share")
+        spread = f" (mean {mean:.1f} +/- {sd:.1f})" if mean is not None and sd is not None else ""
         logger.info("  %-3s %.4f mm³, enamel %.2f%%%s%s%s", tooth["name"], tooth["volume_mm3"],
-                    100 * tooth["enamel_fraction"], f", thickness {thick:.1f} um" if thick is not None else "",
+                    100 * tooth["enamel_fraction"],
+                    f", thickness median {thick:.1f} um{spread}" if thick is not None else "",
                     f", thin patches {100 * thin:.2f}%" if thin is not None else "",
                     f", less dense patches {100 * low:.2f}%" if low is not None else "")
     for contact in summary.get("contacts") or []:

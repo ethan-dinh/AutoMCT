@@ -85,7 +85,11 @@ left empty at either end and wherever its window would straddle missing slices,
 so a curve shows its gaps rather than bridging them, and a group's curve starts
 where its specimens measure half their slices. The crossover (where the ratio
 last rises through 1.0), the mature plateau (its mean 70–95% along the tooth)
-and the peak are read off each specimen's cleaned curve. A specimen's page
+and the peak are read off each specimen's cleaned curve. The plateau and peak
+are also read off the enamel density's running median, in mg HA/cm³ (with the
+scan's HA calibration) and as stored; the Results cards switch between the
+three units, and their tables list all three beside the dentin reference, the
+ratio's denominator. A specimen's page
 draws its outliers in grey. The incisor export marks every slice `kept` or
 `outlier`, with its `residual` from the trend and the running medians
 (`ratio_med`, `density_med`). `trajectory.py` holds the port, and
@@ -239,6 +243,20 @@ sizes stay comparable, and the Specimens list says how far each was turned
 and moved. **As scanned** leaves every one as it sits. To finish by hand, hold
 Option (Alt) with any drag, or press a panel's move button, and the drag turns,
 moves or rolls that specimen alone; **Line them up again** undoes it.
+
+**Landmarks as planes.** Under **Landmarks**, each specimen's own eruption
+and M1-M3 are drawn as planes in their colours (eruption yellow, M1 green, M2
+violet, M3 magenta): a see-through sheet across its scan at the slice each was
+marked on, a molar's where it starts and where it ends, with its rim drawn and
+a line in its colour where it cuts the surface. Tissue in front of a plane
+hides it, and the planes turn and move with their specimen. The marks sit in
+the segmented scan's slices, so the hemimandible, incisor, molar and bone
+views show them as marked; on the straightened incisor each is the
+cross-section its mark maps to along the tooth. Each landmark can be turned off,
+and **Sheets** sets how much a sheet covers (at none, only rims and cut lines
+show). The legend and the saved image name the planes drawn, and a landmark
+past either end of a view's preview is listed rather than drawn.
+
 The surface's colour is read at one depth beneath it in every panel, and the
 page warns when the previews differ in resolution, since a coarser one
 averages thin enamel with what surrounds it. **Save image** writes the panels,
@@ -279,12 +297,22 @@ intensity and the enamel/dentin ratio (the median enamel over the dentin peak,
 which needs no calibration), and between the mean and the lower and upper
 percentiles; its table adds each specimen's dentin peak. **Volume** switches
 between enamel share, enamel, dentin and whole-tooth volume, for the molar row
-or for M1, M2 or M3 alone. **Enamel thickness** shows the median thickness, the
-enamel–dentin junction area, or the thickness divided by that area (µm per mm²,
-`thickness_um_per_mm2` in the molar export), once Molar enamel has measured
-them. The ratio still depends on tooth size: area grows with the square of
+or for M1, M2 or M3 alone. **Enamel thickness** shows the median thickness, its
+mean, its SD across the enamel's own measured points (how uneven each
+specimen's enamel is, `thickness_mean_um` and `thickness_sd_um` in the molar
+export, for the row and per molar), the enamel–dentin junction area, or the
+thickness divided by that area (µm per mm², `thickness_um_per_mm2`), or the
+mean thickness divided by the square root of that area
+(`thickness_mean_per_sqrt_junction`), once Molar enamel has measured them.
+The per-mm² ratio still depends on tooth size: area grows with the square of
 size and thickness only in proportion, so a tooth of the same shape but 10%
-smaller reads 11% higher. A specimen's own page groups its molar numbers the
+smaller reads 11% higher. The mean over √area does not: both are in µm, so it
+has no unit and is shown as a percentage, the enamel's mean thickness as a
+share of the junction's linear size. A tooth of the same shape at any size
+reads the same, so it shows how thickness varies against the size of the
+junction. For the row, √area is of the three junctions together, which is no
+one tooth's size; M1, M2 or M3 alone give the per-tooth proportion. It needs
+no rerun: summaries from version 6 already hold the mean and the area. A specimen's own page groups its molar numbers the
 same way.
 
 **Flagging a specimen.** A scan with motion, a broken incisor tip or the wrong
