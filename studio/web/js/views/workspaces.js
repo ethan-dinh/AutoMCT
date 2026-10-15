@@ -47,6 +47,9 @@ export async function mount(root) {
       h("span", { class: "muted" }, "Looking for workspaces on this computer and its drives…")));
   page.appendChild(body);
   let data = null;
+  // The workspace being opened. Opening takes a moment (the server reads the
+  // whole workspace), so the list waits: one open at a time, and the row says so.
+  let opening = null;
 
   async function load() {
     try {
@@ -55,13 +58,21 @@ export async function mount(root) {
     } catch (err) { errorToast(err); }
   }
 
+  function setOpening(path) {
+    opening = path;
+    if (data) render();
+  }
+
   async function open(path, how = {}) {
+    if (opening) return;
+    setOpening(path);
     try {
       await api.post("/api/workspace", { path, ...how });
       await loadAll();
       toast(`Opened ${basename(path)}.`);
       go("#/");
     } catch (err) {
+      setOpening(null);
       if (err.data?.code === "not_workspace") return offerToCreate(path, err.data);
       errorToast(err);
     }
@@ -72,13 +83,14 @@ export async function mount(root) {
     const ok = await confirmDialog("That folder is not a workspace",
       inside ? `${path} holds other files. Create a new workspace inside it, named ${DEFAULT_NAME}?`
         : `Make ${path} a new, empty workspace?`, "Create workspace");
-    if (!ok) return;
+    if (!ok || opening) return;
+    setOpening(path);
     try {
       await api.post("/api/workspace", inside ? { parent: path, name: DEFAULT_NAME } : { path, create: true });
       await loadAll();
       toast("Workspace created.");
       go("#/");
-    } catch (err) { errorToast(err); }
+    } catch (err) { setOpening(null); errorToast(err); }
   }
 
   // Off the list only: the folder and everything in it stay where they are.
@@ -93,6 +105,7 @@ export async function mount(root) {
   }
 
   async function openOther() {
+    if (opening) return;
     const path = await pickPath({ title: "Open a workspace", mode: "dir", start: data?.places?.[0]?.path || "",
       help: "Choose the workspace folder itself, the one that holds studio.json and a samples folder. Workspaces are tagged in the list." });
     if (path) open(path);
@@ -130,12 +143,14 @@ export async function mount(root) {
       actions: [
         { label: "Cancel" },
         { label: "Create and open", primary: true, onClick: async () => {
+          if (opening) return false;
+          setOpening(joinPath(parent, nameInput.value.trim() || DEFAULT_NAME));
           try {
             await api.post("/api/workspace", { parent, name: nameInput.value.trim() || DEFAULT_NAME });
             await loadAll();
             toast("Workspace created.");
             go("#/");
-          } catch (err) { errorToast(err); return false; }
+          } catch (err) { setOpening(null); errorToast(err); return false; }
           return true;
         } },
       ],
@@ -158,9 +173,12 @@ export async function mount(root) {
         ws.available ? sharingNote(ws.sharing) : null),
       h("div", { class: "ws-act" },
         ws.current ? h("a", { class: "btn", href: "#/" }, "Back to it")
-          : h("button", { class: `btn${primary ? " primary" : ""}`, disabled: !ws.available, onclick: () => open(ws.path) },
-            ws.available ? "Open" : "Not connected"),
-        ws.current ? null : h("button", { class: "btn ghost icon", title: "Remove from the list",
+          : opening === ws.path
+            ? h("button", { class: `btn busy${primary ? " primary" : ""}`, disabled: true, "aria-busy": "true" },
+              h("span", { class: "spinner", "aria-hidden": "true" }), "Opening…")
+            : h("button", { class: `btn${primary ? " primary" : ""}`, disabled: !ws.available || Boolean(opening),
+              onclick: () => open(ws.path) }, ws.available ? "Open" : "Not connected"),
+        ws.current ? null : h("button", { class: "btn ghost icon", title: "Remove from the list", disabled: Boolean(opening),
           "aria-label": `Remove ${ws.name} from the list`, onclick: () => remove(ws) }, icon("x"))));
   }
 
@@ -170,10 +188,11 @@ export async function mount(root) {
     const firstOpenable = [...recent, ...found].find((w) => w.available && !w.current);
     const section = (title, list) => list.length ? h("section", { class: "ws-section" }, h("h2", null, title),
       h("ul", { class: "ws-list" }, list.map((w) => row(w, w === firstOpenable)))) : null;
+    const wait = Boolean(opening);
     const actions = h("div", { class: "ws-actions" },
-      h("button", { class: `btn${firstOpenable ? "" : " primary"}`, onclick: createDialog }, icon("plus"), "Create a workspace"),
-      h("button", { class: "btn", onclick: openOther }, icon("folder"), "Open another folder"),
-      h("button", { class: "btn ghost", onclick: () => { replace(body, h("div", { class: "ws-loading" },
+      h("button", { class: `btn${firstOpenable ? "" : " primary"}`, disabled: wait, onclick: createDialog }, icon("plus"), "Create a workspace"),
+      h("button", { class: "btn", disabled: wait, onclick: openOther }, icon("folder"), "Open another folder"),
+      h("button", { class: "btn ghost", disabled: wait, onclick: () => { replace(body, h("div", { class: "ws-loading" },
         h("div", { class: "progress indeterminate" }, h("i")))); load(); } }, icon("refresh"), "Look again"));
     if (!recent.length && !found.length) {
       replace(body, h("div", { class: "ws-empty" },
@@ -183,7 +202,11 @@ export async function mount(root) {
         actions));
       return;
     }
-    replace(body, section("Recent on this computer", recent), section("Found on connected drives", found), actions);
+    // Opened from "Open another folder" or a create dialog, the folder has no row of its own.
+    const listed = [...recent, ...found].some((w) => w.path === opening);
+    const status = opening && !listed ? h("div", { class: "ws-opening", role: "status" },
+      h("span", { class: "spinner", "aria-hidden": "true" }), h("span", null, `Opening ${basename(opening)}…`)) : null;
+    replace(body, status, section("Recent on this computer", recent), section("Found on connected drives", found), actions);
   }
 
   load();

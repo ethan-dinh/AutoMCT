@@ -211,6 +211,7 @@ code, .mono { font-family: var(--font-code); font-size: 12.5px; }
 .ws-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
 .ws-empty { margin-top: 28px; padding: 26px 28px; border: 1px dashed var(--line-strong); border-radius: var(--r-l); background: var(--surface); }
 .ws-empty p { margin: 8px 0 0; max-width: 62ch; color: var(--ink-2); line-height: 1.5; }
+.ws-opening { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; color: var(--ink-2); }
 .ws-loading { display: flex; flex-direction: column; gap: 10px; margin-top: 30px; max-width: 380px; }
 .conn { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; }
 .conn::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
@@ -241,6 +242,11 @@ main { min-width: 0; outline: none; }
 .btn:disabled, .btn[aria-disabled="true"] { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
 .btn.icon { width: 32px; padding: 0; }
 .btn.small.icon { width: 26px; }
+.btn.busy:disabled { opacity: 1; cursor: progress; gap: 8px; }
+.spinner { width: 14px; height: 14px; flex: none; border-radius: 50%; border: 2px solid currentColor;
+  border-right-color: transparent; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
 
 input[type="text"], input[type="number"], input[type="search"], input[type="date"], select, textarea {
   height: 32px; padding: 0 10px; border-radius: var(--r-m);
