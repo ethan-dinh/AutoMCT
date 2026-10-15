@@ -8,10 +8,10 @@ empty Shapes layer defaults to 2-D and rejects a 3-element `scale`, which only
 surfaced when the tool was run on a real specimen. Constructing the real layers
 here reproduces that class of failure without needing a GL context.
 
-Run:  python test_map_landmarks.py
+Run:  python longitudinal_incisor_analysis/tests/test_map_landmarks.py
 """
 import sys, numpy as np, tempfile, os, types
-sys.path.insert(0,".")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import map_landmarks as M
 from map_landmarks import (CMPRTransform, DEFAULT_LANDMARKS,
                            map_landmarks, write_csv, read_marks_csv)

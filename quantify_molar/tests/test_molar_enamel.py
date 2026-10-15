@@ -9,7 +9,7 @@ that was put there, teeth come out named by size rather than by array order,
 touching teeth are still counted as three, and nothing in the JSON trips up a
 strict parser.
 
-Run with:  python -m pytest quantify_molar/test_molar_enamel.py
+Run with:  python -m pytest quantify_molar/tests/test_molar_enamel.py
 """
 
 # pylint: disable=wrong-import-position
@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 from scipy import ndimage as ndi
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import enamel_surfaces as S  # noqa: E402
 import molar_enamel as M  # noqa: E402

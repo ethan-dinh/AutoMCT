@@ -1223,13 +1223,13 @@ class Tool:
 
 
 TEST_SUITES = [
-    ("quantify_molar", "Molar enamel quantification", ["quantify_molar/test_molar_enamel.py"]),
+    ("quantify_molar", "Molar enamel quantification", ["quantify_molar/tests"]),
     ("converters", "Converter pipeline", ["tools/tests"]),
     ("segmentation", "Segmentation checks",
      ["segment_mandible/tests/test_molar_background.py", "segment_mandible/tests/test_bone_cleanup.py",
       "segment_mandible/tests/test_validation.py", "segment_mandible/tests/test_shrink.py",
       "segment_mandible/tests/test_cache.py"]),
-    ("landmarks", "Landmark detection", ["longitudinal_incisor_analysis/test_detect_landmarks.py"]),
+    ("landmarks", "Landmark detection", ["longitudinal_incisor_analysis/tests/test_detect_landmarks.py"]),
     ("studio", "Studio", ["studio/tests"]),
 ]
 

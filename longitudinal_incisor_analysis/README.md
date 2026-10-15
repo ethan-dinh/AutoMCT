@@ -264,7 +264,7 @@ Run the validation suite (synthetic tests always run; real-data tests skip if th
 mounted):
 
 ```bash
-python test_enamel_density.py [path/to/resliced_volume.nrrd]
+python longitudinal_incisor_analysis/tests/test_enamel_density.py [path/to/resliced_volume.nrrd]
 ```
 
 ### Key flags — quantification
@@ -709,7 +709,7 @@ rather than a measurement hitting a wall.
 
 ## Measured performance
 
-Synthetic data with a known answer, from `test_enamel_density.py`:
+Synthetic data with a known answer, from `tests/test_enamel_density.py`:
 
 | Check | Result |
 |---|---|
@@ -1124,7 +1124,7 @@ neither, the tool assumes `tip-high-z` and logs a warning saying so.
 - **Round-trip.** A written CSV re-maps to identical percentages, spans and events alike.
 - **Real layers, not a permissive stub.** The picker's tests construct genuine napari layer objects
   behind a stubbed viewer, so layer-construction errors surface in the test rather than on a real
-  specimen. Run with `python test_map_landmarks.py`.
+  specimen. Run with `python longitudinal_incisor_analysis/tests/test_map_landmarks.py`.
 - **The transform sidecar** is checked end-to-end through the real pipeline on a synthetic curved
   tooth: **100 % of centerline points land inside the tooth in original-volume coordinates**, the
   assertion that fails if the crop offset is dropped.
@@ -1146,3 +1146,20 @@ neither, the tool assumes `tip-high-z` and logs a warning saying so.
 - **One specimen per transform.** The tool refuses a volume whose shape does not match the
   transform's recorded original shape, catching the common mistake of pairing a transform with the
   wrong scan.
+
+# Tests
+
+The tests live in `tests/` and put this folder on `sys.path` themselves, so run them from the
+repository root:
+
+```bash
+python longitudinal_incisor_analysis/tests/test_enamel_density.py [path/to/resliced_volume.nrrd]
+python longitudinal_incisor_analysis/tests/test_map_landmarks.py
+python -m pytest longitudinal_incisor_analysis/tests/test_detect_landmarks.py
+```
+
+| File | Covers |
+|---|---|
+| `test_enamel_density.py` | Stage 2 on synthetic profiles with a known answer; real-data checks skip when the volume is not given |
+| `test_map_landmarks.py` | Stage 3's napari picker with real layer objects, CSV round-trip, the transform sidecar |
+| `test_detect_landmarks.py` | Automatic landmark detection (eruption, molar spans) on phantoms; also the Studio "Landmark detection" suite |

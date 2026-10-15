@@ -411,8 +411,8 @@ blurrier is judged on less, or more coarsely.
 - Compare within one scanner and protocol: both kinds of patch depend on the
   blur and the noise.
 
-The defaults were set on phantoms (`test_enamel_patches.py`, the patchy cap in
-`test_molar_enamel.py`). `--save-points` keeps every junction point's
+The defaults were set on phantoms (`tests/test_enamel_patches.py`, the patchy cap in
+`tests/test_molar_enamel.py`). `--save-points` keeps every junction point's
 measurements, and `enamel_patches.py sweep` runs the patch stage again on them
 under other settings in seconds, without measuring: the way to check a
 cohort's result against the threshold and the scale.
@@ -420,10 +420,12 @@ cohort's result against the threshold and the scale.
 ## Tests
 
 ```bash
-python -m pytest quantify_molar/test_molar_enamel.py
+python -m pytest quantify_molar/tests
 ```
 
-A three-tooth phantom with enamel caps of known thickness checks the threshold
+Both files live in `tests/` and put this folder on `sys.path` themselves.
+
+`tests/test_molar_enamel.py`: a three-tooth phantom with enamel caps of known thickness checks the threshold
 position, the enamel fraction against construction, tooth naming in both scan
 orientations, thickness, the fixed threshold, the enamel density and its
 percentiles against the noise that was built in, the mg HA/cm³ conversion, the
@@ -445,7 +447,7 @@ only 3.3 σ deep does). The histogram's threshold must say whether it came from
 the valley or the knee. `tools/tests/test_scanco_calibration.py` pins the
 calibration reader to the bytes of a real Scanco header.
 
-`test_enamel_patches.py` paints thicknesses and densities on a tilted sheet of
+`tests/test_enamel_patches.py` paints thicknesses and densities on a tilted sheet of
 junction points: uniform enamel and steady slopes have no patches, disks
 thinner than the rest are found once at their size and depth, wide thinning
 only in part, shallow, small or barely-thinner ones not at all, a taper to the

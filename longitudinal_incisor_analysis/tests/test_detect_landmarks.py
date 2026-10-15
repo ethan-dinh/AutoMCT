@@ -10,7 +10,7 @@ the lingual side runs on for a while. Eruption is where no ray from the enamel
 touches bone: with the band's edge rays left out (3 degrees each side), where
 the opening passes 114 degrees, 12.7 slices into it.
 
-Run with:  python -m pytest longitudinal_incisor_analysis/test_detect_landmarks.py
+Run with:  python -m pytest longitudinal_incisor_analysis/tests/test_detect_landmarks.py
 """
 
 import sys
@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from detect_landmarks import (  # noqa: E402
     enamel_rays,

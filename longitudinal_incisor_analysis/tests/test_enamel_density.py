@@ -9,17 +9,20 @@ are the ones that matter most: they are the only place where the true answer is
 known, so they are what distinguishes a working detector from one that merely
 produces plausible-looking curves.
 
-Run:  python test_enamel_density.py [path/to/resliced_volume.tif]
+Run:  python longitudinal_incisor_analysis/tests/test_enamel_density.py [path/to/resliced_volume.tif]
 The real-data tests are skipped when the volume is not reachable.
 """
 
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import numpy as np
 
-import enamel_density as ed
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import enamel_density as ed  # noqa: E402
 
 
 PASS, FAIL = "\033[92mPASS\033[0m", "\033[91mFAIL\033[0m"

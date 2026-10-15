@@ -10,7 +10,7 @@ patch is found once, at its size and depth; anatomy that changes steadily is
 not a patch; nothing is judged where the enamel tapers to the margin or meets
 the next tooth.
 
-Run with:  python -m pytest quantify_molar/test_enamel_patches.py
+Run with:  python -m pytest quantify_molar/tests/test_enamel_patches.py
 """
 
 # pylint: disable=wrong-import-position
@@ -22,7 +22,7 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import enamel_patches as P  # noqa: E402
 
