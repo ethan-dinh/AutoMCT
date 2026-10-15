@@ -117,9 +117,23 @@ function saveTable(table, format) {
   else saveBlob(csv(table), `${slug(table.title)}.csv`, "text/csv");
 }
 
+// navigator.clipboard needs a secure page; served over http to an iPad
+// (python -m studio --tailscale) it is missing, and the old copy command still works.
+async function writeClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+  const area = h("textarea", { readonly: true, style: { position: "fixed", opacity: "0", top: "0", left: "0" } });
+  area.value = text;
+  document.body.append(area);
+  area.select();
+  area.setSelectionRange(0, text.length);
+  const ok = document.execCommand("copy");
+  area.remove();
+  if (!ok) throw new Error("This browser would not copy; save the table as CSV instead.");
+}
+
 async function copyTable(table) {
   try {
-    await navigator.clipboard.writeText(tsv(table));
+    await writeClipboard(tsv(table));
     toast(table.type === "xy" ? "Copied. In Prism, paste into an XY table from its X title cell."
       : "Copied. In Prism, paste into a Column table from its first title cell.");
   } catch (err) { errorToast(err); }

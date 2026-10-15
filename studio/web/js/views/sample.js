@@ -71,8 +71,9 @@ export async function mount(root, [name]) {
         h("a", { class: "btn primary", href: `#/viewer/${enc(name)}` }, icon("viewer"), "Open viewer"),
         h("button", { class: "btn", onclick: editDetails }, icon("edit"), "Edit details"),
         s.excluded ? null : h("button", { class: "btn", onclick: () => flag(null), title: "Leave it out of the results, with a note" }, icon("flag"), "Flag"),
-        h("button", { class: "btn", title: "Show the sample folder in Finder", onclick: () => api.post("/api/reveal", { path: detail.folder }).catch(errorToast) }, icon("folder"), "Show folder"),
-        detail.artifacts.some((a) => a.key === "reoriented" && a.exists)
+        // Served to an iPad, these would open on the host's screen, not here.
+        state.app.remote ? null : h("button", { class: "btn", title: "Show the sample folder in Finder", onclick: () => api.post("/api/reveal", { path: detail.folder }).catch(errorToast) }, icon("folder"), "Show folder"),
+        !state.app.remote && detail.artifacts.some((a) => a.key === "reoriented" && a.exists)
           ? h("button", { class: "btn", title: "Open the full-resolution scan in napari", onclick: () =>
             api.post("/api/napari", { sample: name, artifact: "reoriented" }).then(() => toast("Opening napari with the full-resolution scan…", "info")).catch(errorToast) },
           icon("external"), "napari") : null,
@@ -120,9 +121,9 @@ export async function mount(root, [name]) {
     return h("div", { class: "stack", style: { gap: "6px", marginTop: "6px" } },
       h("div", { class: "sample-meta", style: { marginTop: 0 } },
         h("span", null, "Large files beside the scan, in ", h("code", { title: st.path }, shown),
-          st.exists ? [" ", h("button", { class: "btn small ghost", style: { verticalAlign: "middle" }, title: st.path,
+          st.exists && !state.app.remote ? [" ", h("button", { class: "btn small ghost", style: { verticalAlign: "middle" }, title: st.path,
             onclick: () => api.post("/api/reveal", { path: st.path }).catch(errorToast) }, icon("folder"), "Show")]
-            : " (made on the first conversion or segmentation)")),
+            : st.exists ? null : " (made on the first conversion or segmentation)")),
       st.synced ? h("div", { class: "notice warning" },
         `This folder syncs to ${st.synced}, so the large files written here upload to it too.`) : null);
   }
@@ -588,7 +589,7 @@ export async function mount(root, [name]) {
     const rows = detail.artifacts.filter((a) => a.exists).sort((a, b) => a.label.localeCompare(b.label));
     return h("div", { class: "panel", style: { marginTop: "16px" } },
       h("div", { class: "panel-head" }, h("h2", { class: "grow" }, "Files"),
-        h("button", { class: "btn small ghost", onclick: () => api.post("/api/reveal", { path: detail.folder }).catch(errorToast) }, "Show folder")),
+        state.app.remote ? null : h("button", { class: "btn small ghost", onclick: () => api.post("/api/reveal", { path: detail.folder }).catch(errorToast) }, "Show folder")),
       h("div", { class: "panel-body files" }, rows.length ? rows.map((a) => h("div", { class: "file" },
         h("div", { style: { minWidth: 0 } }, h("div", null, a.label,
           a.where === "linked" ? h("span", { class: "tag", style: { marginLeft: "6px" } }, "linked")

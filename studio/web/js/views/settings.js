@@ -52,7 +52,7 @@ export function mount(root) {
           h("span", null, sharing.text)) : null,
         h("div", { class: "row wrap" },
           h("a", { class: "btn", href: "#/workspaces" }, icon("folder"), "Switch workspace"),
-          h("button", { class: "btn ghost", onclick: () => api.post("/api/reveal", { path: app.workspace.root }).catch(errorToast) }, reveal))),
+          app.remote ? null : h("button", { class: "btn ghost", onclick: () => api.post("/api/reveal", { path: app.workspace.root }).catch(errorToast) }, reveal))),
       set("Jobs at once", "Conversion, segmentation, CMPR and quantification each hold whole scans in memory; two at once can exhaust a 16-24 GB machine.",
         ["heavy", "preview", "light"].map((lane) => h("label", { class: "row" },
           h("span", { style: { width: "150px" } }, { heavy: "Heavy jobs", preview: "Preview builds", light: "Small jobs" }[lane]),

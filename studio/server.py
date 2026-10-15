@@ -4,7 +4,8 @@ The studio's HTTP server: the JSON API, uploads, the event stream, and the UI.
 Standard library only (``http.server``), so the studio runs in the existing
 ``microct-analysis`` environment with nothing more to install.
 
-It listens on localhost and is meant for the person at the machine. Two checks
+It listens on localhost and is meant for the person at the machine (or, with
+``--tailscale``, for their own devices on their tailnet: see remote.py). Two checks
 keep other websites out of it anyway, since a page in any browser tab can
 send requests to localhost: the Host header must name this server, which
 defeats DNS rebinding, and a request that changes anything must come from this
@@ -699,6 +700,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = f"MicroCTStudio/{__version__}"
     studio: Studio  # set on the class by serve()
     allowed_hosts: set[str] = set()
+    remote = False  # served to other devices: Finder and napari would open on a screen nobody sees
 
     # -- plumbing ---------------------------------------------------------
 
@@ -905,6 +907,7 @@ class Handler(BaseHTTPRequestHandler):
             "python": PYTHON,
             "repo": str(REPO),
             "platform": sys.platform,
+            "remote": self.remote,
         })
 
     @route("GET", r"/api/events")
@@ -1614,14 +1617,17 @@ WITHOUT_WORKSPACE = {"api_state", "api_events", "api_workspaces", "api_workspace
 
 
 def serve(root: Path | None, host: str = "127.0.0.1", port: int = 8765, remember: bool = True,
-          prefs: Path = PREFS) -> tuple[ThreadingHTTPServer, Studio]:
+          prefs: Path = PREFS, extra_hosts: tuple[str, ...] = ()) -> tuple[ThreadingHTTPServer, Studio]:
+    """Start the server; ``extra_hosts`` are further names it answers to (a tailnet's MagicDNS names)."""
     studio = Studio(root, remember=remember, prefs=prefs)
     Handler.studio = studio
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
     bound = server.server_address[1]
     names = {"127.0.0.1", "localhost", "[::1]"}
-    if host not in ("127.0.0.1", "localhost", "::1", ""):
+    Handler.remote = host not in ("127.0.0.1", "localhost", "::1")
+    if Handler.remote and host:
         names.add(host)
+    names.update(n.lower() for n in extra_hosts)
     Handler.allowed_hosts = {f"{n}:{bound}" for n in names}
     return server, studio

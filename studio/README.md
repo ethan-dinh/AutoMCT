@@ -10,6 +10,7 @@ conda activate microct-analysis
 python -m studio                        # opens http://localhost:8765 and asks for a workspace
 python -m studio --last                 # reopen the last workspace without asking
 python -m studio --workspace "/Volumes/LabDrive/MicroCT-Studio" --port 8800 --no-browser
+python -m studio --last --tailscale     # use it from an iPad over Tailscale (remote.md)
 ```
 
 Nothing to install: the server is the Python standard library and the UI is
@@ -562,13 +563,22 @@ molar view also overlays the three teeth it split apart (M1 green, M2 violet,
 M3 pink, the landmark colours); in 3-D they colour the teeth, so a wrong split
 shows at a glance.
 
+## Using it from an iPad
+
+`python -m studio --last --tailscale` serves the studio to your own devices
+over Tailscale, so it can be demoed from an iPad while the Mac stays behind.
+It listens on the Mac's tailnet address only and keeps the Mac awake. The
+setup, a night-before checklist and troubleshooting are in
+[remote.md](remote.md).
+
 ## Security
 
 The server listens on `127.0.0.1` only, and it can run jobs and list files on
 this machine, so it is meant for the person at the keyboard. It refuses
 requests whose `Host` header is not its own (DNS rebinding) and changes coming
 from any other origin (cross-site requests). Do not pass `--host 0.0.0.0` on a
-shared network.
+shared network. `--tailscale` (above) listens on the tailnet address only, so
+every device in your tailnet can use the studio and nothing else can.
 
 ## Development
 
